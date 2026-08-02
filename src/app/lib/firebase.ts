@@ -6,6 +6,7 @@ import {
   onAuthStateChanged,
   signInWithEmailAndPassword,
   signOut as firebaseSignOut,
+  updateProfile,
   type User,
 } from "firebase/auth";
 import {
@@ -107,8 +108,18 @@ export async function signIn(email: string, password: string): Promise<User> {
   return cred.user;
 }
 
-export async function signUp(email: string, password: string): Promise<User> {
+export async function signUp(email: string, password: string, name?: string): Promise<User> {
   const cred = await createUserWithEmailAndPassword(auth, email.trim(), password);
+  const trimmed = name?.trim();
+  if (trimmed) {
+    // Store the name on the Auth user. Unlike Firestore this needs no database,
+    // so the account still has an identity if the cloud read fails.
+    try {
+      await updateProfile(cred.user, { displayName: trimmed });
+    } catch (err) {
+      console.warn("Failed to set displayName:", err);
+    }
+  }
   return cred.user;
 }
 
@@ -142,6 +153,9 @@ export function authErrorMessage(err: unknown): string {
   const code = typeof err === "object" && err && "code" in err
     ? String((err as { code: string }).code)
     : "";
+  // Always log the real error. Returning only a friendly string used to discard
+  // the code entirely, which left "Something went wrong" with nothing to debug.
+  console.error("Auth error:", code || "(no code)", err);
   switch (code) {
     case "auth/email-already-in-use":
       return "That email is already registered. Sign in instead.";
@@ -157,8 +171,24 @@ export function authErrorMessage(err: unknown): string {
       return "Too many attempts. Try again later.";
     case "auth/requires-recent-login":
       return "Sign out and sign back in, then try deleting again.";
+    case "auth/operation-not-allowed":
+      return "Email/password sign-in is not enabled for this Firebase project.";
+    case "auth/network-request-failed":
+      return "Couldn’t reach Firebase. Check your connection and try again.";
+    case "auth/api-key-not-valid":
+    case "auth/invalid-api-key":
+      return "This app’s Firebase API key is invalid. Check your .env.";
+    case "auth/admin-restricted-operation":
+      return "Sign-ups are disabled for this Firebase project.";
+    case "auth/password-does-not-meet-requirements":
+      return "Password doesn’t meet this project’s password policy.";
+    case "auth/missing-password":
+      return "Enter a password.";
     default:
-      return "Something went wrong. Please try again.";
+      // Show the code — a generic message with no code is undebuggable.
+      return code
+        ? `Sign-in failed (${code}). See the browser console for details.`
+        : "Something went wrong. Please try again.";
   }
 }
 
@@ -171,6 +201,12 @@ let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingState: UserState | null = null;
 let pendingUid: string | null = null;
 
+/** Notified after every attempted write: null on success, the error on failure. */
+let syncListener: ((err: unknown | null) => void) | null = null;
+export function onSyncResult(cb: ((err: unknown | null) => void) | null) {
+  syncListener = cb;
+}
+
 async function flush() {
   const state = pendingState;
   const uid = pendingUid;
@@ -182,8 +218,11 @@ async function flush() {
       { ...state, updatedAt: serverTimestamp() },
       { merge: true }
     );
+    syncListener?.(null);
   } catch (err) {
+    // Swallowing this is how a failing sync looks identical to a working one.
     console.warn("Firestore sync failed:", err);
+    syncListener?.(err);
   }
 }
 
@@ -193,4 +232,13 @@ export function saveUserState(uid: string, state: UserState) {
   pendingState = state;
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(flush, 800);
+}
+
+/** Write any debounced state immediately — call before the page can go away. */
+export function flushUserState(): Promise<void> {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  return flush();
 }

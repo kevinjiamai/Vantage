@@ -16,7 +16,7 @@ import {
   quoteChangeForRange, downsampleLTTB, sparklineMaxPoints,
   type StockMeta, type SearchResult, type StockNewsItem, type TimeRange,
 } from "./lib/stocks";
-import { loadUserState, saveUserState, subscribeAuth, signIn, signUp, signOut, deleteAccount, authErrorMessage, DEFAULT_PREFS, type UserState, type UserPrefs } from "./lib/firebase";
+import { loadUserState, saveUserState, flushUserState, onSyncResult, subscribeAuth, signIn, signUp, signOut, deleteAccount, authErrorMessage, DEFAULT_PREFS, type UserState, type UserPrefs } from "./lib/firebase";
 import type { User } from "firebase/auth";
 import { VantageChat } from "./components/VantageChat";
 
@@ -141,6 +141,9 @@ interface Profile {
   pic: string;
 }
 
+/** Lifecycle of the signed-in user's Firestore document. */
+type CloudStatus = "idle" | "loading" | "ready" | "error";
+
 const DEFAULT_WATCHLISTS: Watchlist[] = [
   { id: "portfolio", name: "All Stocks", symbols: [...ALL_SYMBOLS] },
   { id: "wl-tech",  name: "Tech",        symbols: ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "NFLX"] },
@@ -152,6 +155,19 @@ const DEFAULT_PROFILE: Profile = {
   email: "",
   pic: "",
 };
+
+/** Read a JSON value written by the persistence effects; falls back on any bad/missing data. */
+function readLocal<T>(key: string, fallback: T, valid: (v: unknown) => boolean): T {
+  if (typeof window === "undefined") return fallback;
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (raw === null) return fallback;
+    const parsed = JSON.parse(raw) as unknown;
+    return valid(parsed) ? (parsed as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 const TIME_RANGES: TimeRange[] = ["1D", "1W", "1M", "3M", "6M", "YTD", "1Y", "2Y", "5Y", "10Y", "ALL"];
 const FILTER_MODES: FilterMode[] = ["all", "gainers", "losers", "movers", "owned"];
@@ -1209,7 +1225,7 @@ const HR = {
   change: "w-[4.5rem] flex-shrink-0 text-left",
   shares: "w-[4.5rem] flex-shrink-0 text-left tabular-nums",
   avg:    "w-[4.75rem] flex-shrink-0 text-left tabular-nums",
-  profit: "w-[5rem] flex-shrink-0 text-left tabular-nums",
+  profit: "w-[6.25rem] flex-shrink-0 text-left tabular-nums",
   value:  "w-[5rem] flex-shrink-0 text-left tabular-nums",
   menu:   "w-6 flex-shrink-0",
 } as const;
@@ -1225,7 +1241,7 @@ function HoldingCols(props: {
 }) {
   const { symbol, price, change, shares, avg, profit, value } = props;
   return (
-    <div className="flex items-center flex-1 min-w-[42rem]">
+    <div className="flex items-center flex-1 min-w-[43.25rem]">
       <div className={HR.symbol}>{symbol}</div>
       <div className="w-6 sm:w-10 flex-shrink-0" aria-hidden />
       <div className="flex items-center gap-3 flex-shrink-0">
@@ -1275,7 +1291,7 @@ function HoldingListHeader({
 
   return (
     <div
-      className={`flex items-center gap-3 ${HR.pad} pb-1.5 mb-1 text-[9px] font-mono uppercase tracking-widest min-w-[42rem]`}
+      className={`flex items-center gap-3 ${HR.pad} pb-1.5 mb-1 text-[9px] font-mono uppercase tracking-widest min-w-[43.25rem]`}
       style={{ color: "var(--v-ink-dim)" }}
     >
       <HoldingCols
@@ -1283,7 +1299,7 @@ function HoldingListHeader({
         price={<SortLabel mode="price">Price</SortLabel>}
         change={<SortLabel mode={changeSort}>Change</SortLabel>}
         shares="Shares"
-        avg="Avg"
+        avg="Avg cost"
         profit="Profit"
         value="Value"
       />
@@ -1317,7 +1333,7 @@ function HoldingRow({
 
   return (
     <div
-      className={`group flex items-center gap-3 ${HR.pad} py-3 rounded-xl border transition-all duration-150 min-w-[42rem]`}
+      className={`group flex items-center gap-3 ${HR.pad} py-3 rounded-xl border transition-all duration-150 min-w-[43.25rem]`}
       style={{
         background:  "var(--v-panel)",
         borderColor: isPinned ? "rgba(52,211,153,0.35)" : "var(--v-line)",
@@ -1365,14 +1381,16 @@ function HoldingRow({
           </span>
         )}
         profit={stock.price > 0 ? (
-          <span
-            className="font-mono text-[11px] truncate"
-            style={{ color: profit >= 0 ? G : R }}
-          >
-            {changeDisplay === "amount"
-              ? `${profit >= 0 ? "+" : ""}${fmt$(profit)}`
-              : fmtPct(profitPct)}
-          </span>
+          // Gain/loss is always shown as both $ and %, independent of the
+          // change-display toggle — that toggle is for the price column.
+          <div className="flex flex-col leading-tight min-w-0" style={{ color: profit >= 0 ? G : R }}>
+            <span className="font-mono text-[11px] truncate">
+              {profit >= 0 ? "+" : ""}{fmt$(profit)}
+            </span>
+            <span className="font-mono text-[10px] opacity-75 truncate">
+              {fmtPct(profitPct)}
+            </span>
+          </div>
         ) : (
           <TextSkeleton width="2.75rem" height="0.65rem" />
         )}
@@ -2446,6 +2464,9 @@ function StockDetailView({
     ((stock.price - stock.low52w) / (stock.high52w - stock.low52w)) * 100
   ));
   const profit = holding ? (stock.price - holding.avgCost) * holding.shares : 0;
+  const profitPct = holding && holding.avgCost > 0
+    ? ((stock.price - holding.avgCost) / holding.avgCost) * 100
+    : 0;
 
   useEffect(() => {
     let cancelled = false;
@@ -2617,6 +2638,7 @@ function StockDetailView({
                 <div className="text-[9px] font-mono uppercase tracking-widest" style={{ color: "var(--v-ink-dim)" }}>Profit</div>
                 <div className="font-mono text-sm font-semibold mt-0.5 tabular-nums" style={{ color: profit >= 0 ? G : R }}>
                   {profit >= 0 ? "+" : ""}{fmt$(profit)}
+                  <span className="text-[11px] font-medium opacity-75 ml-1">{fmtPct(profitPct)}</span>
                 </div>
               </div>
             </div>
@@ -2854,13 +2876,15 @@ function MarketStrip({ stocks, status }: { stocks: StockMeta[]; status: "loading
 // ─── BankPage ──────────────────────────────────────────────────────────────────
 
 function BankPage({
-  balance, transactions, onDeposit, signedIn, onSignIn,
+  balance, transactions, onDeposit, signedIn, onSignIn, syncFailed, onRetrySync,
 }: {
   balance: number;
   transactions: Transaction[];
   onDeposit: (amount: number) => void;
   signedIn: boolean;
   onSignIn: () => void;
+  syncFailed: boolean;
+  onRetrySync: () => void;
 }) {
   const [depositOpen, setDepositOpen] = useState(false);
   const TX_PAGE = 6;
@@ -2876,7 +2900,9 @@ function BankPage({
   return (
     <div className="flex-1 overflow-y-auto p-5" style={{ scrollbarWidth: "thin", scrollbarColor: "var(--v-line-strong) transparent" }}>
       <div className="max-w-2xl mx-auto flex flex-col gap-4">
-        {!signedIn && <GuestSaveBanner onSignIn={onSignIn} />}
+        {syncFailed
+          ? <SyncErrorBanner onRetry={onRetrySync} />
+          : !signedIn && <GuestSaveBanner onSignIn={onSignIn} />}
 
         <div className="rounded-2xl border p-6" style={{ background: "var(--v-panel)", borderColor: "var(--v-line)" }}>
           <div className="flex items-center justify-between gap-4">
@@ -3071,11 +3097,13 @@ function buildWatchlistsFromSelection(selected: Set<string>): Watchlist[] {
 // ─── Auth forms ────────────────────────────────────────────────────────────────
 
 function AuthPanel({
-  onSignedIn,
+  onAuth,
 }: {
-  onSignedIn: (mode: "signin" | "signup") => Promise<void> | void;
+  /** Performs the actual sign-in/sign-up. Throws so this panel can show the error. */
+  onAuth: (mode: "signin" | "signup", email: string, password: string, name: string) => Promise<void>;
 }) {
   const [mode, setMode] = useState<"signin" | "signup">("signin");
+  const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -3084,18 +3112,21 @@ function AuthPanel({
 
   const submit = async () => {
     const e = email.trim();
+    const n = name.trim();
     if (!e || password.length < 6) {
       setError(password.length > 0 && password.length < 6
         ? "Password must be at least 6 characters."
         : "Enter email and password.");
       return;
     }
+    if (mode === "signup" && (n.length < 1 || n.length > 80)) {
+      setError("Enter your name (1–80 characters).");
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
-      if (mode === "signup") await signUp(e, password);
-      else await signIn(e, password);
-      await onSignedIn(mode);
+      await onAuth(mode, e, password, n);
     } catch (err) {
       setError(authErrorMessage(err));
     } finally {
@@ -3132,6 +3163,24 @@ function AuthPanel({
           </button>
         ))}
       </div>
+
+      {mode === "signup" && (
+        <div>
+          <label className="block text-[10px] font-mono uppercase tracking-widest mb-2" style={{ color: "var(--v-ink-dim)" }}>
+            Name
+          </label>
+          <input
+            type="text"
+            autoComplete="name"
+            maxLength={80}
+            value={name}
+            onChange={e => setName(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter") submit(); }}
+            className="w-full px-3 py-2.5 rounded-xl text-sm font-mono outline-none"
+            style={{ background: "var(--v-line)", color: "var(--v-ink)", border: "1px solid var(--v-line-strong)" }}
+          />
+        </div>
+      )}
 
       <div>
         <label className="block text-[10px] font-mono uppercase tracking-widest mb-2" style={{ color: "var(--v-ink-dim)" }}>
@@ -3193,13 +3242,16 @@ function AuthPanel({
 }
 
 function OnboardingDialog({
-  email, onComplete,
+  email, initialName, onComplete,
 }: {
   email: string;
+  initialName: string;
   onComplete: (name: string, selected: string[]) => void;
 }) {
-  const [step, setStep] = useState<"name" | "stocks">("name");
-  const [name, setName] = useState("");
+  // A name given at sign-up is already the user's name — don't ask for it twice.
+  const knownName = initialName.trim().slice(0, 80);
+  const [step, setStep] = useState<"name" | "stocks">(knownName ? "stocks" : "name");
+  const [name, setName] = useState(knownName);
   const [selected, setSelected] = useState<Set<string>>(() => new Set(TECH_STARTER));
   const [sectorTab, setSectorTab] = useState(ONBOARDING_SECTORS[0].sector);
   const trimmed = name.trim();
@@ -3375,6 +3427,32 @@ function GuestSaveBanner({
         onClick={onSignIn}
       >
         Sign in to save
+      </button>
+    </div>
+  );
+}
+
+function SyncErrorBanner({
+  onRetry, className = "",
+}: {
+  onRetry: () => void;
+  className?: string;
+}) {
+  return (
+    <div
+      className={`flex flex-wrap items-center gap-3 px-4 py-3 rounded-xl text-[12px] ${className}`}
+      style={{ background: "rgba(248,113,113,0.08)", border: "1px solid rgba(248,113,113,0.3)", color: "var(--v-ink-soft)" }}
+    >
+      <div className="flex-1 min-w-[12rem] leading-relaxed">
+        You’re signed in, but we couldn’t reach your saved data. Changes aren’t syncing right now.
+      </div>
+      <button
+        type="button"
+        className="px-3 py-1.5 rounded-lg text-[11px] font-semibold flex-shrink-0"
+        style={{ background: R, color: "#0a0a0a" }}
+        onClick={onRetry}
+      >
+        Retry
       </button>
     </div>
   );
@@ -3600,7 +3678,7 @@ function AccountPage({
   onResetTradeHistory: () => void;
   onSignOut: () => void;
   onDeleteAccount: () => Promise<void>;
-  onAuthDone: (mode: "signin" | "signup") => Promise<void> | void;
+  onAuthDone: (mode: "signin" | "signup", email: string, password: string, name: string) => Promise<void>;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(false);
@@ -3622,7 +3700,7 @@ function AccountPage({
     return (
       <div className="flex-1 overflow-y-auto p-5" style={{ scrollbarWidth: "thin", scrollbarColor: "var(--v-line-strong) transparent" }}>
         <div className="max-w-md mx-auto mt-10 rounded-2xl border p-6" style={{ background: "var(--v-panel)", borderColor: "var(--v-line)" }}>
-          <AuthPanel onSignedIn={onAuthDone} />
+          <AuthPanel onAuth={onAuthDone} />
         </div>
       </div>
     );
@@ -3748,13 +3826,22 @@ export default function App() {
   const [selectedSymbol,  setSelectedSymbol] = useState<string | null>(null);
   const [pinnedSymbols,   setPinnedSymbols]  = useState<string[]>([]);
   const [customOrders,    setCustomOrders]   = useState<Record<string, string[]>>({});
-  const [balance,         setBalance]        = useState(0);
-  const [holdings,        setHoldings]       = useState<Holding[]>([]);
-  const [transactions,    setTransactions]   = useState<Transaction[]>([]);
-  const [profile,         setProfile]        = useState<Profile>(DEFAULT_PROFILE);
+  const [balance,         setBalance]        = useState(() =>
+    readLocal("vantage-balance", 0, v => typeof v === "number" && Number.isFinite(v)),
+  );
+  const [holdings,        setHoldings]       = useState<Holding[]>(() =>
+    readLocal<Holding[]>("vantage-holdings", [], Array.isArray),
+  );
+  const [transactions,    setTransactions]   = useState<Transaction[]>(() =>
+    readLocal<Transaction[]>("vantage-tx", [], Array.isArray),
+  );
+  const [profile,         setProfile]        = useState<Profile>(() =>
+    readLocal<Profile>("vantage-profile", DEFAULT_PROFILE, v => !!v && typeof v === "object" && !Array.isArray(v)),
+  );
   const [user,            setUser]           = useState<User | null>(null);
   const [needsNameSetup,  setNeedsNameSetup] = useState(false);
   const [setupComplete,   setSetupComplete]  = useState(false);
+  const [cloudStatus,     setCloudStatus]    = useState<CloudStatus>("idle");
   const [stocks,          setStocks]         = useState<StockMeta[]>(STOCKS_META);
   const [dataStatus,      setDataStatus]     = useState<"loading" | "live" | "stale" | "error">(
     STOCKS_META.some(s => s.price > 0) ? "stale" : "loading",
@@ -3828,7 +3915,16 @@ export default function App() {
 
   // ─── Auth + Firestore sync ────────────────────────────────────────────────────
   const cloudReady = useRef(false);
-  const signedIn = !!user && setupComplete;
+  const authSettled = useRef(false);
+  /** Name captured during sign-up, so onboarding never has to ask for it again. */
+  const pendingSignupName = useRef("");
+
+  // True cloud-sync state. Previously "signed in but not yet loaded" and "signed in
+  // but the load failed" were both indistinguishable from "guest".
+  const syncing = !!user && (cloudStatus === "idle" || cloudStatus === "loading");
+  const syncFailed = !!user && cloudStatus === "error";
+  const setupDone = setupComplete || syncFailed;
+  const signedIn = !!user && (setupDone || syncing);
 
   const buildCloudState = useCallback((): UserState => ({
     balance,
@@ -3900,67 +3996,129 @@ export default function App() {
     setNeedsNameSetup(false);
     setSetupComplete(false);
     cloudReady.current = false;
+    pendingSignupName.current = "";
   }, [clearTradeData]);
 
-  useEffect(() => {
-    return subscribeAuth(async next => {
-      setUser(next);
-      if (!next) {
-        resetToGuest();
-        return;
-      }
-
-      cloudReady.current = false;
-      try {
-        const saved = await loadUserState(next.uid);
-        const email = next.email ?? "";
-        if (saved?.setupComplete && saved.profile?.name) {
-          if (typeof saved.balance === "number") setBalance(saved.balance);
-          if (Array.isArray(saved.holdings)) setHoldings(saved.holdings as Holding[]);
-          if (Array.isArray(saved.transactions)) setTransactions(saved.transactions as Transaction[]);
-          setProfile({
-            ...DEFAULT_PROFILE,
-            ...saved.profile,
-            email: saved.profile.email || email,
-          });
-          const lists = asWatchlists(saved.watchlists) ?? DEFAULT_WATCHLISTS;
-          setWatchlists(lists);
-          applyPrefs(asPrefs(saved.prefs), lists);
-          const symbols = [...new Set(lists.flatMap(w => w.symbols))];
-          if (symbols.length) {
-            ensureQuotes(symbols)
-              .then(live => setStocks([...live]))
-              .catch(() => {});
-          }
-          setNeedsNameSetup(false);
-          setSetupComplete(true);
-        } else {
-          clearTradeData();
-          setProfile({
-            ...DEFAULT_PROFILE,
-            email,
-          });
-          setNeedsNameSetup(true);
-          setSetupComplete(false);
-          setPage("account");
+  const loadCloudState = useCallback(async (next: User) => {
+    cloudReady.current = false;
+    setCloudStatus("loading");
+    const email = next.email ?? "";
+    // Identity comes from the Auth user, not Firestore. Seed it up front so a
+    // failed cloud read can't leave the account page blank.
+    const authName = next.displayName || pendingSignupName.current;
+    setProfile(prev => ({
+      ...prev,
+      email: prev.email || email,
+      name: prev.name || authName,
+    }));
+    try {
+      const saved = await loadUserState(next.uid);
+      if (saved?.setupComplete && saved.profile?.name) {
+        if (typeof saved.balance === "number") setBalance(saved.balance);
+        if (Array.isArray(saved.holdings)) setHoldings(saved.holdings as Holding[]);
+        if (Array.isArray(saved.transactions)) setTransactions(saved.transactions as Transaction[]);
+        setProfile({
+          ...DEFAULT_PROFILE,
+          ...saved.profile,
+          email: saved.profile.email || email,
+        });
+        const lists = asWatchlists(saved.watchlists) ?? DEFAULT_WATCHLISTS;
+        setWatchlists(lists);
+        applyPrefs(asPrefs(saved.prefs), lists);
+        const symbols = [...new Set(lists.flatMap(w => w.symbols))];
+        if (symbols.length) {
+          ensureQuotes(symbols)
+            .then(live => setStocks([...live]))
+            .catch(() => {});
         }
-      } catch (err) {
-        console.warn("Firestore load failed:", err);
+        setNeedsNameSetup(false);
+        setSetupComplete(true);
+      } else {
+        // The read SUCCEEDED and there is genuinely no completed profile —
+        // this is the only case where onboarding is the right answer.
         clearTradeData();
-        setProfile({ ...DEFAULT_PROFILE, email: next.email ?? "" });
+        setProfile({ ...DEFAULT_PROFILE, email, name: authName });
         setNeedsNameSetup(true);
         setSetupComplete(false);
         setPage("account");
-      } finally {
-        cloudReady.current = true;
       }
-    });
-  }, [clearTradeData, resetToGuest, applyPrefs]);
+      cloudReady.current = true;
+      setCloudStatus("ready");
+    } catch (err) {
+      // The read FAILED, so we have no idea what's in the cloud. Treating that as
+      // "new user" is what re-asked for the name and made the app look signed out.
+      // Keep local state, keep the user signed in, and leave writes disabled so we
+      // can't overwrite good cloud data with a blank slate.
+      console.warn("Firestore load failed:", err);
+      cloudReady.current = false;
+      setCloudStatus("error");
+    }
+  }, [applyPrefs, clearTradeData]);
 
+  useEffect(() => {
+    return subscribeAuth(next => {
+      setUser(next);
+      if (!next) {
+        // Firebase emits null once on startup before it resolves a session. Only
+        // clear on a real sign-out, otherwise it wipes the restored guest state.
+        if (authSettled.current) resetToGuest();
+        authSettled.current = true;
+        setCloudStatus("idle");
+        return;
+      }
+      authSettled.current = true;
+      void loadCloudState(next);
+    });
+  }, [resetToGuest, loadCloudState]);
+
+  const retryCloudLoad = useCallback(() => {
+    if (user) void loadCloudState(user);
+  }, [user, loadCloudState]);
+
+  // App drives the auth call so the sign-up name is recorded BEFORE Firebase fires
+  // onAuthStateChanged. Setting it after signUp() resolves is already too late —
+  // the listener has run and built the profile with an empty name.
+  const handleAuth = useCallback(async (
+    mode: "signin" | "signup", email: string, password: string, name: string,
+  ) => {
+    if (mode === "signup") {
+      pendingSignupName.current = name;
+      try {
+        await signUp(email, password, name);
+      } catch (err) {
+        pendingSignupName.current = "";
+        throw err;
+      }
+    } else {
+      await signIn(email, password);
+    }
+  }, []);
+
+  // Surface write failures the same way as read failures instead of only logging.
+  useEffect(() => {
+    onSyncResult(err => setCloudStatus(prev => (err ? "error" : prev === "error" ? "ready" : prev)));
+    return () => onSyncResult(null);
+  }, []);
+
+  // cloudStatus is in the deps so a recovered sync flushes pending local changes
+  // instead of waiting for the next unrelated edit.
   useEffect(() => {
     if (!cloudReady.current || !user || !setupComplete) return;
     saveUserState(user.uid, buildCloudState());
-  }, [buildCloudState, user, setupComplete]);
+  }, [buildCloudState, user, setupComplete, cloudStatus]);
+
+  // The cloud write is debounced; make sure it lands if the page is hidden or closed.
+  useEffect(() => {
+    const onHide = () => {
+      if (document.visibilityState === "hidden") flushUserState();
+    };
+    document.addEventListener("visibilitychange", onHide);
+    window.addEventListener("pagehide", flushUserState);
+    return () => {
+      document.removeEventListener("visibilitychange", onHide);
+      window.removeEventListener("pagehide", flushUserState);
+    };
+  }, []);
 
   const handleOnboarding = useCallback((name: string, selectedSymbols: string[]) => {
     if (!user) return;
@@ -3987,6 +4145,7 @@ export default function App() {
     setNeedsNameSetup(false);
     setSetupComplete(true);
     cloudReady.current = true;
+    pendingSignupName.current = "";
     saveUserState(user.uid, {
       balance: 0,
       holdings: [],
@@ -4416,6 +4575,8 @@ export default function App() {
           onDeposit={deposit}
           signedIn={signedIn}
           onSignIn={goSignIn}
+          syncFailed={syncFailed}
+          onRetrySync={retryCloudLoad}
         />
       )}
 
@@ -4432,7 +4593,7 @@ export default function App() {
           onResetTradeHistory={resetTradeHistory}
           onSignOut={handleSignOut}
           onDeleteAccount={handleDeleteAccount}
-          onAuthDone={() => {}}
+          onAuthDone={handleAuth}
         />
       )}
 
@@ -4456,9 +4617,9 @@ export default function App() {
               className="flex-1 overflow-auto p-4"
               style={{ scrollbarWidth: "thin", scrollbarColor: "var(--v-line-strong) transparent" }}
             >
-              {!signedIn && (
-                <GuestSaveBanner onSignIn={goSignIn} className="mb-4" />
-              )}
+              {syncFailed
+                ? <SyncErrorBanner onRetry={retryCloudLoad} className="mb-4" />
+                : !signedIn && <GuestSaveBanner onSignIn={goSignIn} className="mb-4" />}
               <div className="flex items-center justify-between gap-3 mb-4 px-1">
                 <div>
                   <div className="font-mono text-[13px] font-semibold tracking-wide" style={{ color: "var(--v-ink)" }}>
@@ -4654,6 +4815,7 @@ export default function App() {
       {needsNameSetup && user && (
         <OnboardingDialog
           email={profile.email || user.email || ""}
+          initialName={profile.name || pendingSignupName.current}
           onComplete={handleOnboarding}
         />
       )}
