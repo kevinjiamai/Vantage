@@ -7,6 +7,7 @@ import { useRangeChange } from "../hooks/useRangeChange";
 import { G, R, fmt$, fmtCap, fmtChangeAmt, fmtPct, fmtVol } from "../lib/format";
 import { type StockMeta, type TimeRange } from "../lib/stocks";
 import { type ChangeDisplay, type Holding, type SortDir, type SortMode, type Watchlist } from "../types";
+import { positionProfit, positionProfitPct } from "../lib/trades";
 
 /** Shared column layout so header labels + row cells stay aligned */
 export const LR = {
@@ -139,10 +140,8 @@ export function StockCard({
   const delta = useRangeChange(stock.symbol, range, stock, refreshKey);
   const isGain = delta.changePercent >= 0;
   const [menuOpen, setMenuOpen] = useState(false);
-  const profit = holding ? (stock.price - holding.avgCost) * holding.shares : 0;
-  const profitPct = holding && holding.avgCost > 0
-    ? ((stock.price - holding.avgCost) / holding.avgCost) * 100
-    : 0;
+  const profit = holding ? positionProfit(holding, stock.price) : 0;
+  const profitPct = holding ? positionProfitPct(holding, stock.price) : 0;
   const profitUp = profit >= 0;
 
   return (

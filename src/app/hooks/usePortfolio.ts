@@ -1,6 +1,7 @@
 import { useCallback, useMemo } from "react";
 import type { StockMeta } from "../lib/stocks";
 import type { Holding, Transaction } from "../types";
+import { applyBuy, applySell, newTransaction } from "../lib/trades";
 import { usePersistentState } from "./usePersistentState";
 
 const isNum = (v: unknown) => typeof v === "number" && Number.isFinite(v);
@@ -43,53 +44,21 @@ export function usePortfolio(stocks: StockMeta[]): Portfolio {
 
   const deposit = useCallback((amount: number) => {
     setBalance(b => b + amount);
-    setTransactions(prev => [{
-      id: "tx-" + Date.now(),
-      type: "deposit",
-      amount,
-      timestamp: Date.now(),
-    }, ...prev]);
+    setTransactions(prev => [newTransaction("deposit", amount), ...prev]);
   }, [setBalance, setTransactions]);
 
   const buyShares = useCallback((symbol: string, shares: number, price: number) => {
     const cost = shares * price;
     setBalance(b => b - cost);
-    setHoldings(prev => {
-      const existing = prev.find(h => h.symbol === symbol);
-      if (!existing) return [...prev, { symbol, shares, avgCost: price }];
-      const totalShares = existing.shares + shares;
-      const avgCost = (existing.avgCost * existing.shares + price * shares) / totalShares;
-      return prev.map(h => h.symbol === symbol ? { symbol, shares: totalShares, avgCost } : h);
-    });
-    setTransactions(prev => [{
-      id: "tx-" + Date.now(),
-      type: "buy",
-      amount: cost,
-      symbol,
-      shares,
-      price,
-      timestamp: Date.now(),
-    }, ...prev]);
+    setHoldings(prev => applyBuy(prev, symbol, shares, price));
+    setTransactions(prev => [newTransaction("buy", cost, { symbol, shares, price }), ...prev]);
   }, [setBalance, setHoldings, setTransactions]);
 
   const sellShares = useCallback((symbol: string, shares: number, price: number) => {
     const proceeds = shares * price;
     setBalance(b => b + proceeds);
-    setHoldings(prev => prev.flatMap(h => {
-      if (h.symbol !== symbol) return [h];
-      const remaining = h.shares - shares;
-      // Float residue would otherwise leave a phantom 1e-17 share position.
-      return remaining > 1e-9 ? [{ ...h, shares: remaining }] : [];
-    }));
-    setTransactions(prev => [{
-      id: "tx-" + Date.now(),
-      type: "sell",
-      amount: proceeds,
-      symbol,
-      shares,
-      price,
-      timestamp: Date.now(),
-    }, ...prev]);
+    setHoldings(prev => applySell(prev, symbol, shares));
+    setTransactions(prev => [newTransaction("sell", proceeds, { symbol, shares, price }), ...prev]);
   }, [setBalance, setHoldings, setTransactions]);
 
   const reset = useCallback(() => {

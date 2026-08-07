@@ -7,6 +7,7 @@ import { useRangeChange } from "../hooks/useRangeChange";
 import { G, R, fmt$, fmtChangeAmt, fmtPct } from "../lib/format";
 import { type StockMeta, type TimeRange } from "../lib/stocks";
 import { type ChangeDisplay, type Holding, type SortDir, type SortMode, type Watchlist } from "../types";
+import { positionProfit, positionProfitPct, positionValue } from "../lib/trades";
 
 export const HR = {
   pad: "px-4",
@@ -117,9 +118,9 @@ export function HoldingRow({
   const delta = useRangeChange(stock.symbol, range, stock, refreshKey);
   const isGain = delta.changePercent >= 0;
   const [menuOpen, setMenuOpen] = useState(false);
-  const value = stock.price * holding.shares;
-  const profit = (stock.price - holding.avgCost) * holding.shares;
-  const profitPct = holding.avgCost > 0 ? ((stock.price - holding.avgCost) / holding.avgCost) * 100 : 0;
+  const value = positionValue(holding, stock.price);
+  const profit = positionProfit(holding, stock.price);
+  const profitPct = positionProfitPct(holding, stock.price);
 
   return (
     <div

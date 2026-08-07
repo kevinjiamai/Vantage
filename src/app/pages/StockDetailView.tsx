@@ -10,6 +10,7 @@ import { useRangeChange } from "../hooks/useRangeChange";
 import { G, R, fmt$, fmtCap, fmtChangeAmt, fmtPct, fmtVol } from "../lib/format";
 import { type StockMeta, type StockNewsItem, type TimeRange, fetchStockNews } from "../lib/stocks";
 import { type Holding } from "../types";
+import { positionProfit, positionProfitPct } from "../lib/trades";
 
 export function StockDetailView({
   stock, range, holding, balance, onBack, onRangeChange, onBuy, onSell, signedIn, onSignIn,
@@ -35,10 +36,8 @@ export function StockDetailView({
   const pct52 = Math.max(0, Math.min(100,
     ((stock.price - stock.low52w) / (stock.high52w - stock.low52w)) * 100
   ));
-  const profit = holding ? (stock.price - holding.avgCost) * holding.shares : 0;
-  const profitPct = holding && holding.avgCost > 0
-    ? ((stock.price - holding.avgCost) / holding.avgCost) * 100
-    : 0;
+  const profit = holding ? positionProfit(holding, stock.price) : 0;
+  const profitPct = holding ? positionProfitPct(holding, stock.price) : 0;
 
   useEffect(() => {
     let cancelled = false;
