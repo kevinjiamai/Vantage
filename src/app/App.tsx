@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { Sun, Moon, ChevronLeft, ChevronRight, BarChart2, LayoutGrid, List } from "lucide-react";
+import { Sun, Moon, BarChart2 } from "lucide-react";
 import { ALL_SYMBOLS, prefetchSparklines, type StockMeta, type TimeRange } from "./lib/stocks";
 import { VantageChat } from "./components/VantageChat";
 
-import { G, R, fmt$ } from "./lib/format";
+import { G, R } from "./lib/format";
 import { buildHoldingRows, screenStocks, sortHoldingRows } from "./lib/screener";
 import type { AppPage, Holding } from "./types";
 
@@ -13,15 +13,12 @@ import { useQuotes } from "./hooks/useQuotes";
 import { usePortfolio } from "./hooks/usePortfolio";
 import { useCloudSync } from "./hooks/useCloudSync";
 
-import { ListHeader, StockCard, StockRow } from "./components/stocks";
-import { HoldingListHeader, HoldingRow } from "./components/holdings";
-import { WatchlistSidebar } from "./components/watchlists";
-import { Toolbar } from "./components/toolbar";
 import { BuySharesDialog, SellSharesDialog } from "./components/trade";
-import { GuestSaveBanner, OnboardingDialog, SyncErrorBanner, buildWatchlistsFromSelection } from "./components/auth";
+import { OnboardingDialog, buildWatchlistsFromSelection } from "./components/auth";
 import { MarketStrip } from "./components/MarketStrip";
-import { StockDetailView } from "./pages/StockDetailView";
 import { BankPage } from "./pages/BankPage";
+import { HomePage } from "./pages/HomePage";
+import { PortfolioPage } from "./pages/PortfolioPage";
 import { AccountPage } from "./pages/AccountPage";
 
 const NAV_ITEMS: { id: AppPage; label: string }[] = [
@@ -46,22 +43,20 @@ export default function App() {
   // ─── Domain state ───────────────────────────────────────────────────────────
   const prefs = usePreferences();
   const {
-    theme, setTheme, homeRange, setHomeRange, detailRanges,
-    filter, setFilter, sort, sortDir, changeDisplay, setChangeDisplay,
-    viewMode, setViewMode, watchlists, activeWatchlist, setActiveWatchlist,
-    pinnedSymbols, customOrders, activeList, setCustomOrders,
-    onSortSelect, onColumnSort, togglePin,
-    createWatchlist, deleteWatchlist, renameWatchlist, reorderWatchlists,
+    theme, setTheme, homeRange, detailRanges, filter, sort, sortDir,
+    changeDisplay, watchlists, activeWatchlist, setActiveWatchlist,
+    pinnedSymbols, customOrders, activeList, setCustomOrders, togglePin,
   } = prefs;
 
   const quotes = useQuotes(homeRange, watchlists, activeWatchlist);
-  const { stocks, dataStatus, sparkEpoch, hydrate: hydrateStocks } = quotes;
+  const { stocks, dataStatus, sparkEpoch } = quotes;
 
   const portfolio = usePortfolio(stocks);
   const {
     balance, holdings, transactions, holdingMap,
     portfolioValue, totalCost, totalProfit,
     deposit, buyShares, sellShares, reset: resetTradeHistory,
+
   } = portfolio;
 
   const cloud = useCloudSync(portfolio, prefs, quotes, setPage);
@@ -193,6 +188,20 @@ export default function App() {
 
   const selectedDetailRange = selectedSymbol ? (detailRanges[selectedSymbol] ?? "1D") : "1D";
 
+  // Both Home and Portfolio show the same detail view; build its props once.
+  const detailProps = selectedStock ? {
+    stock: selectedStock,
+    range: selectedDetailRange,
+    holding: holdingMap.get(selectedStock.symbol),
+    balance,
+    onBack: () => setSelectedSymbol(null),
+    onRangeChange: (r: TimeRange) => setDetailRange(selectedStock.symbol, r),
+    onBuy:  (shares: number) => buyShares(selectedStock.symbol, shares, selectedStock.price),
+    onSell: (shares: number) => sellShares(selectedStock.symbol, shares, selectedStock.price),
+    signedIn,
+    onSignIn: goSignIn,
+  } : null;
+
   return (
     <div className="flex flex-col h-screen overflow-hidden" style={{ background: "var(--v-bg)", color: "var(--v-ink)" }}>
       {/* Header */}
@@ -276,219 +285,39 @@ export default function App() {
       )}
 
       {page === "portfolio" && (
-        <div className="flex-1 flex flex-col overflow-hidden min-h-0">
-          {selectedStock ? (
-            <StockDetailView
-              stock={selectedStock}
-              range={selectedDetailRange}
-              holding={holdingMap.get(selectedStock.symbol)}
-              balance={balance}
-              onBack={() => setSelectedSymbol(null)}
-              onRangeChange={r => setDetailRange(selectedStock.symbol, r)}
-              onBuy={shares => buyShares(selectedStock.symbol, shares, selectedStock.price)}
-              onSell={shares => sellShares(selectedStock.symbol, shares, selectedStock.price)}
-              signedIn={signedIn}
-              onSignIn={goSignIn}
-            />
-          ) : (
-            <div
-              className="flex-1 overflow-auto p-4"
-              style={{ scrollbarWidth: "thin", scrollbarColor: "var(--v-line-strong) transparent" }}
-            >
-              {syncFailed
-                ? <SyncErrorBanner onRetry={retryCloudLoad} className="mb-4" />
-                : !signedIn && <GuestSaveBanner onSignIn={goSignIn} className="mb-4" />}
-              <div className="flex items-center justify-between gap-3 mb-4 px-1">
-                <div>
-                  <div className="font-mono text-[13px] font-semibold tracking-wide" style={{ color: "var(--v-ink)" }}>
-                    Your holdings
-                  </div>
-                  <div className="text-[11px] mt-0.5" style={{ color: "var(--v-ink-dim)" }}>
-                    {holdings.length === 0
-                      ? "Buy shares from a stock’s detail page"
-                      : `${holdings.length} position${holdings.length !== 1 ? "s" : ""} · P/L ${totalProfit >= 0 ? "+" : ""}${fmt$(totalProfit)}`}
-                  </div>
-                </div>
-                <div className="flex items-center gap-3 flex-shrink-0">
-                  <button
-                    onClick={() => setChangeDisplay(changeDisplay === "percent" ? "amount" : "percent")}
-                    className="flex items-center justify-center w-8 py-1.5 rounded-lg text-xs font-mono font-semibold transition-colors"
-                    style={{ background: "var(--v-line)", color: "var(--v-ink)" }}
-                    title={changeDisplay === "percent" ? "Showing % — click for $" : "Showing $ — click for %"}
-                  >
-                    {changeDisplay === "percent" ? "%" : "$"}
-                  </button>
-                  <div className="flex rounded-lg p-0.5" style={{ background: "var(--v-line)" }}>
-                    <button
-                      onClick={() => setViewMode("grid")}
-                      className="w-7 h-7 rounded-md flex items-center justify-center transition-all"
-                      style={{
-                        background: viewMode === "grid" ? "var(--v-ink)"   : "transparent",
-                        color:      viewMode === "grid" ? "var(--v-panel)" : "var(--v-ink-soft)",
-                      }}
-                      title="Grid view"
-                    >
-                      <LayoutGrid size={13} />
-                    </button>
-                    <button
-                      onClick={() => setViewMode("list")}
-                      className="w-7 h-7 rounded-md flex items-center justify-center transition-all"
-                      style={{
-                        background: viewMode === "list" ? "var(--v-ink)"   : "transparent",
-                        color:      viewMode === "list" ? "var(--v-panel)" : "var(--v-ink-soft)",
-                      }}
-                      title="List view"
-                    >
-                      <List size={13} />
-                    </button>
-                  </div>
-                  <div className="font-mono text-sm font-semibold" style={{ color: "var(--v-ink)" }}>
-                    {fmt$(portfolioValue)}
-                  </div>
-                </div>
-              </div>
-              {portfolioStocks.length === 0 ? (
-                <div className="flex flex-col items-center justify-center h-64 gap-2 font-mono text-sm" style={{ color: "var(--v-ink-dim)" }}>
-                  <BarChart2 size={32} style={{ color: "var(--v-line-strong)" }} />
-                  <span>No shares owned yet</span>
-                </div>
-              ) : viewMode === "grid" ? (
-                <div className="grid gap-3 grid-cols-[repeat(2,minmax(10.5rem,1fr))] lg:grid-cols-[repeat(3,minmax(11rem,1fr))] xl:grid-cols-[repeat(4,minmax(11rem,1fr))] 2xl:grid-cols-[repeat(5,minmax(11rem,1fr))]">
-                  {portfolioStocks.map(({ stock, holding }) => (
-                    <StockCard key={stock.symbol} {...sharedCardProps(stock, holding)} />
-                  ))}
-                </div>
-              ) : (
-                <div className="min-w-max">
-                  <HoldingListHeader
-                    sort={sort}
-                    sortDir={sortDir}
-                    changeDisplay={changeDisplay}
-                    onColumnSort={onColumnSort}
-                  />
-                  <div className="flex flex-col gap-1.5">
-                    {portfolioStocks.map(({ stock, holding }) => (
-                      <HoldingRow
-                        key={stock.symbol}
-                        stock={stock}
-                        holding={holding}
-                        range={homeRange}
-                        watchlists={watchlists}
-                        isPinned={pinnedSymbols.includes(stock.symbol)}
-                        changeDisplay={changeDisplay}
-                        refreshKey={sparkEpoch}
-                        onSelect={() => selectSymbol(stock.symbol)}
-                        onToggleWatchlist={toggleWatchlist}
-                        onTogglePin={togglePin}
-                      />
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
+        <PortfolioPage
+          prefs={prefs}
+          portfolio={portfolio}
+          quotes={quotes}
+          rows={portfolioStocks}
+          cardProps={sharedCardProps}
+          detail={detailProps}
+          signedIn={signedIn}
+          syncFailed={syncFailed}
+          onSignIn={goSignIn}
+          onRetrySync={retryCloudLoad}
+          onSelectSymbol={selectSymbol}
+          onToggleWatchlist={toggleWatchlist}
+        />
       )}
 
       {page === "home" && (
-        <div className="flex flex-1 overflow-hidden min-h-0">
-          <WatchlistSidebar
-            watchlists={watchlists}
-            activeId={activeWatchlist}
-            open={sidebarOpen}
-            onSelect={id => { setActiveWatchlist(id); setSelectedSymbol(null); }}
-            onCreate={createWatchlist}
-            onDelete={deleteWatchlist}
-            onRename={renameWatchlist}
-            onReorder={reorderWatchlists}
-          />
-
-          <button
-            type="button"
-            onClick={() => setSidebarOpen(v => !v)}
-            className="flex-shrink-0 self-stretch w-4 flex items-center justify-center border-r z-20 transition-colors hover:bg-white/5"
-            style={{
-              background: "var(--v-panel)",
-              borderColor: "var(--v-line)",
-              color: "var(--v-ink-soft)",
-            }}
-            title={sidebarOpen ? "Hide watchlists" : "Show watchlists"}
-            aria-label={sidebarOpen ? "Hide watchlists" : "Show watchlists"}
-            aria-expanded={sidebarOpen}
-          >
-            {sidebarOpen
-              ? <ChevronLeft size={12} />
-              : <ChevronRight size={12} />}
-          </button>
-
-          <div className="flex-1 flex flex-col overflow-hidden min-w-0 min-h-0">
-            {selectedStock ? (
-              <StockDetailView
-                stock={selectedStock}
-                range={selectedDetailRange}
-                holding={holdingMap.get(selectedStock.symbol)}
-                balance={balance}
-                onBack={() => setSelectedSymbol(null)}
-                onRangeChange={r => setDetailRange(selectedStock.symbol, r)}
-                onBuy={shares => buyShares(selectedStock.symbol, shares, selectedStock.price)}
-                onSell={shares => sellShares(selectedStock.symbol, shares, selectedStock.price)}
-                signedIn={signedIn}
-                onSignIn={goSignIn}
-              />
-            ) : (
-              <>
-                <Toolbar
-                  range={homeRange}     setRange={setHomeRange}
-                  filter={filter}   setFilter={setFilter}
-                  sort={sort}       sortDir={sortDir} onSortSelect={onSortSelect}
-                  changeDisplay={changeDisplay} setChangeDisplay={setChangeDisplay}
-                  search={search}   setSearch={setSearch}
-                  viewMode={viewMode} setViewMode={setViewMode}
-                  watchlists={watchlists}
-                  stocks={stocks}
-                  onSelectSymbol={openSymbol}
-                  onToggleWatchlist={toggleWatchlist}
-                  onStocksHydrated={hydrateStocks}
-                  refreshKey={sparkEpoch}
-                />
-
-                <div
-                  className="flex-1 overflow-auto p-4"
-                  style={{ scrollbarWidth: "thin", scrollbarColor: "var(--v-line-strong) transparent" }}
-                  onDragOver={e => e.preventDefault()}
-                >
-                  {visibleStocks.length === 0 ? (
-                    <div className="flex flex-col items-center justify-center h-full gap-2 font-mono text-sm" style={{ color: "var(--v-ink-dim)" }}>
-                      <BarChart2 size={32} style={{ color: "var(--v-line-strong)" }} />
-                      <span>No stocks match your filters</span>
-                    </div>
-                  ) : viewMode === "grid" ? (
-                    <div className="grid gap-3 grid-cols-[repeat(2,minmax(10.5rem,1fr))] lg:grid-cols-[repeat(3,minmax(11rem,1fr))] xl:grid-cols-[repeat(4,minmax(11rem,1fr))] 2xl:grid-cols-[repeat(5,minmax(11rem,1fr))]">
-                      {visibleStocks.map(stock => (
-                        <StockCard key={stock.symbol} {...sharedCardProps(stock)} />
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="min-w-max">
-                      <ListHeader
-                        sort={sort}
-                        sortDir={sortDir}
-                        changeDisplay={changeDisplay}
-                        onColumnSort={onColumnSort}
-                      />
-                      <div className="flex flex-col gap-1.5">
-                        {visibleStocks.map(stock => (
-                          <StockRow key={stock.symbol} {...sharedCardProps(stock)} />
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </>
-            )}
-          </div>
-        </div>
+        <HomePage
+          prefs={prefs}
+          quotes={quotes}
+          visibleStocks={visibleStocks}
+          cardProps={sharedCardProps}
+          detail={detailProps}
+          search={search}
+          setSearch={setSearch}
+          sidebarOpen={sidebarOpen}
+          onToggleSidebar={() => setSidebarOpen(v => !v)}
+          onSelectWatchlist={id => { setActiveWatchlist(id); setSelectedSymbol(null); }}
+          onOpenSymbol={openSymbol}
+          onToggleWatchlist={toggleWatchlist}
+        />
       )}
+
 
       {needsNameSetup && user && (
         <OnboardingDialog

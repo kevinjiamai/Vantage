@@ -1,5 +1,5 @@
 import { MoreHorizontal, Star } from "lucide-react";
-import { useState } from "react";
+import { useState, type ComponentProps } from "react";
 import { MiniSparkline } from "./charts";
 import { TextSkeleton } from "./common";
 import { CardMenu, TradeMenu } from "./menus";
@@ -388,3 +388,9 @@ export function StockRow({
     </div>
   );
 }
+
+/**
+ * The prop bundle StockCard and StockRow share. App builds one factory and the
+ * pages spread it, so the two views can't drift apart.
+ */
+export type CardProps = ComponentProps<typeof StockCard>;
