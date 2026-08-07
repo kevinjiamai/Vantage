@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Sun, Moon, BarChart2 } from "lucide-react";
 import { ALL_SYMBOLS, prefetchSparklines, type StockMeta, type TimeRange } from "./lib/stocks";
-import { VantageChat } from "./components/VantageChat";
+// Floating assistant: not needed for first paint, so it loads on its own.
+const VantageChat = lazy(() =>
+  import("./components/VantageChat").then(m => ({ default: m.VantageChat })));
 
 import { G, R } from "./lib/format";
 import { buildHoldingRows, screenStocks, sortHoldingRows } from "./lib/screener";
@@ -352,20 +354,22 @@ export default function App() {
         );
       })()}
 
-      <VantageChat
-        context={{
-          signedIn,
-          watchlistSymbols: [...new Set(watchlists.flatMap(w => w.symbols))],
-          holdings,
-          stocks: stocks.map(s => ({
-            symbol: s.symbol,
-            name: s.name,
-            sector: s.sector,
-            price: s.price,
-            changePercent: s.changePercent,
-          })),
-        }}
-      />
+      <Suspense fallback={null}>
+        <VantageChat
+          context={{
+            signedIn,
+            watchlistSymbols: [...new Set(watchlists.flatMap(w => w.symbols))],
+            holdings,
+            stocks: stocks.map(s => ({
+              symbol: s.symbol,
+              name: s.name,
+              sector: s.sector,
+              price: s.price,
+              changePercent: s.changePercent,
+            })),
+          }}
+        />
+      </Suspense>
     </div>
   );
 }
