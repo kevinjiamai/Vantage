@@ -7,7 +7,9 @@
     "build": "vite build",
     "dev": "vite",
     "api": "server/.venv/bin/python -m uvicorn main:app --app-dir server --reload --host 127.0.0.1 --port 8000",
-    "dev:all": "npx concurrently -k -n api,web -c green,cyan \"npm run api\" \"npm run dev\""
+    "dev:all": "npx concurrently -k -n api,web -c green,cyan \"npm run api\" \"npm run dev\"",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@emotion/react": "11.14.0",
@@ -76,6 +78,7 @@
     "@vitejs/plugin-react": "4.7.0",
     "tailwindcss": "^4.1.12",
     "typescript": "^5.8.3",
-    "vite": "^6.4.3"
+    "vite": "^6.4.3",
+    "vitest": "^4.1.10"
   }
 }

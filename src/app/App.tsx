@@ -1,13 +1,17 @@
-import { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Sun, Moon, ChevronLeft, ChevronRight, BarChart2, LayoutGrid, List } from "lucide-react";
-import { STOCKS_META, ALL_SYMBOLS, fetchQuotes, ensureQuotes, lastQuotesFreshness, prefetchSparklines, invalidateHistoryRange, clearHistoryCache, quoteChangeForRange, type StockMeta, type TimeRange } from "./lib/stocks";
-import { loadUserState, saveUserState, flushUserState, onSyncResult, subscribeAuth, signIn, signUp, signOut, deleteAccount, DEFAULT_PREFS, type UserState, type UserPrefs } from "./lib/firebase";
-import type { User } from "firebase/auth";
+import { ALL_SYMBOLS, prefetchSparklines, type StockMeta, type TimeRange } from "./lib/stocks";
 import { VantageChat } from "./components/VantageChat";
 
 import { G, R, fmt$ } from "./lib/format";
-import { DEFAULT_WATCHLISTS, DEFAULT_PROFILE, TIME_RANGES, readLocal, asWatchlists, asPrefs, type AppPage, type FilterMode, type SortMode, type SortDir, type ChangeDisplay, type ViewMode, type Watchlist, type Holding, type Transaction, type Profile, type CloudStatus } from "./types";
+import { buildHoldingRows, screenStocks, sortHoldingRows } from "./lib/screener";
+import type { AppPage, Holding } from "./types";
+
+import { usePreferences } from "./hooks/usePreferences";
+import { useQuotes } from "./hooks/useQuotes";
+import { usePortfolio } from "./hooks/usePortfolio";
+import { useCloudSync } from "./hooks/useCloudSync";
 
 import { ListHeader, StockCard, StockRow } from "./components/stocks";
 import { HoldingListHeader, HoldingRow } from "./components/holdings";
@@ -28,590 +32,90 @@ const NAV_ITEMS: { id: AppPage; label: string }[] = [
 ];
 
 export default function App() {
-  const [page,            setPage]           = useState<AppPage>("home");
-  const [theme,           setTheme]          = useState<"dark" | "light">("dark");
-  const [homeRange,       setHomeRange]      = useState<TimeRange>("1D");
-  const [detailRanges,    setDetailRanges]   = useState<Record<string, TimeRange>>({});
-  const [filter,          setFilter]         = useState<FilterMode>("all");
-  const [sort,            setSort]           = useState<SortMode>("manual");
-  const [sortDir,         setSortDir]        = useState<SortDir>("desc");
-  const [changeDisplay,   setChangeDisplay]  = useState<ChangeDisplay>("percent");
-  const [search,          setSearch]         = useState("");
-  const [viewMode,        setViewMode]       = useState<ViewMode>("grid");
-  const [watchlists,      setWatchlists]     = useState<Watchlist[]>(DEFAULT_WATCHLISTS);
-  const [activeWatchlist, setActiveWatchlist]= useState("portfolio");
-  const [sidebarOpen,     setSidebarOpen]    = useState(() =>
+  // ─── Local UI state (nothing persisted, nothing shared) ─────────────────────
+  const [page,           setPage]           = useState<AppPage>("home");
+  const [search,         setSearch]         = useState("");
+  const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
+  const [tradeDialog,    setTradeDialog]    = useState<{ symbol: string; mode: "buy" | "sell" } | null>(null);
+  const [sidebarOpen,    setSidebarOpen]    = useState(() =>
     typeof window !== "undefined" ? window.matchMedia("(min-width: 768px)").matches : true,
   );
-  const [selectedSymbol,  setSelectedSymbol] = useState<string | null>(null);
-  const [pinnedSymbols,   setPinnedSymbols]  = useState<string[]>([]);
-  const [customOrders,    setCustomOrders]   = useState<Record<string, string[]>>({});
-  const [balance,         setBalance]        = useState(() =>
-    readLocal("vantage-balance", 0, v => typeof v === "number" && Number.isFinite(v)),
-  );
-  const [holdings,        setHoldings]       = useState<Holding[]>(() =>
-    readLocal<Holding[]>("vantage-holdings", [], Array.isArray),
-  );
-  const [transactions,    setTransactions]   = useState<Transaction[]>(() =>
-    readLocal<Transaction[]>("vantage-tx", [], Array.isArray),
-  );
-  const [profile,         setProfile]        = useState<Profile>(() =>
-    readLocal<Profile>("vantage-profile", DEFAULT_PROFILE, v => !!v && typeof v === "object" && !Array.isArray(v)),
-  );
-  const [user,            setUser]           = useState<User | null>(null);
-  const [needsNameSetup,  setNeedsNameSetup] = useState(false);
-  const [setupComplete,   setSetupComplete]  = useState(false);
-  const [cloudStatus,     setCloudStatus]    = useState<CloudStatus>("idle");
-  const [stocks,          setStocks]         = useState<StockMeta[]>(STOCKS_META);
-  const [dataStatus,      setDataStatus]     = useState<"loading" | "live" | "stale" | "error">(
-    STOCKS_META.some(s => s.price > 0) ? "stale" : "loading",
-  );
-  const [sparkEpoch,      setSparkEpoch]     = useState(0);
-  const [tradeDialog,     setTradeDialog]    = useState<{ symbol: string; mode: "buy" | "sell" } | null>(null);
-
   const dragSymbolRef = useRef<string | null>(null);
   const [dragOver, setDragOver] = useState<string | null>(null);
+
+  // ─── Domain state ───────────────────────────────────────────────────────────
+  const prefs = usePreferences();
+  const {
+    theme, setTheme, homeRange, setHomeRange, detailRanges,
+    filter, setFilter, sort, sortDir, changeDisplay, setChangeDisplay,
+    viewMode, setViewMode, watchlists, activeWatchlist, setActiveWatchlist,
+    pinnedSymbols, customOrders, activeList, setCustomOrders,
+    onSortSelect, onColumnSort, togglePin,
+    createWatchlist, deleteWatchlist, renameWatchlist, reorderWatchlists,
+  } = prefs;
+
+  const quotes = useQuotes(homeRange, watchlists, activeWatchlist);
+  const { stocks, dataStatus, sparkEpoch, hydrate: hydrateStocks } = quotes;
+
+  const portfolio = usePortfolio(stocks);
+  const {
+    balance, holdings, transactions, holdingMap,
+    portfolioValue, totalCost, totalProfit,
+    deposit, buyShares, sellShares, reset: resetTradeHistory,
+  } = portfolio;
+
+  const cloud = useCloudSync(portfolio, prefs, quotes, setPage);
+  const {
+    user, profile, setProfile, signedIn, syncFailed, needsNameSetup,
+    handleAuth, handleSignOut, handleDeleteAccount,
+    retry: retryCloudLoad, completeOnboarding,
+  } = cloud;
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
   }, [theme]);
 
-  useEffect(() => {
-    let cancelled = false;
-    clearHistoryCache();
-    const applyQuotes = (live: StockMeta[]) => {
-      setStocks([...live]);
-      setDataStatus(lastQuotesFreshness === "live" ? "live" : live.some(s => s.price > 0) ? "stale" : "error");
-    };
-    (async () => {
-      try {
-        const live = await fetchQuotes();
-        if (cancelled) return;
-        applyQuotes(live);
-        await prefetchSparklines(ALL_SYMBOLS, homeRange);
-        if (!cancelled) setSparkEpoch(e => e + 1);
-      } catch {
-        if (cancelled) return;
-        // Keep last-good (local / in-memory) prices instead of fake placeholders
-        if (STOCKS_META.some(s => s.price > 0)) {
-          setStocks([...STOCKS_META]);
-          setDataStatus("stale");
-        } else {
-          setDataStatus("error");
-        }
-      }
-    })();
-    const id = window.setInterval(() => {
-      fetchQuotes()
-        .then(async live => {
-          if (cancelled) return;
-          applyQuotes(live);
-          invalidateHistoryRange("1D");
-          await prefetchSparklines(live.map(s => s.symbol), "1D");
-          if (!cancelled) setSparkEpoch(e => e + 1);
-        })
-        .catch(() => {
-          if (cancelled) return;
-          if (STOCKS_META.some(s => s.price > 0)) setDataStatus("stale");
-          else setDataStatus("error");
-        });
-    }, 60_000);
-    return () => { cancelled = true; window.clearInterval(id); };
-  }, []);
+  // ─── Actions that span two concerns ─────────────────────────────────────────
 
-  // When the toolbar range changes, load matching history for visible symbols
-  useEffect(() => {
-    const list = watchlists.find(w => w.id === activeWatchlist);
-    const syms = list?.symbols ?? ALL_SYMBOLS;
-    prefetchSparklines(syms, homeRange)
-      .then(() => setSparkEpoch(e => e + 1))
-      .catch(() => {});
-  }, [homeRange, activeWatchlist, watchlists]);
-
-  useEffect(() => { localStorage.setItem("vantage-balance", JSON.stringify(balance)); }, [balance]);
-  useEffect(() => { localStorage.setItem("vantage-holdings", JSON.stringify(holdings)); }, [holdings]);
-  useEffect(() => { localStorage.setItem("vantage-tx", JSON.stringify(transactions)); }, [transactions]);
-  useEffect(() => { localStorage.setItem("vantage-profile", JSON.stringify(profile)); }, [profile]);
-
-  // ─── Auth + Firestore sync ────────────────────────────────────────────────────
-  const cloudReady = useRef(false);
-  const authSettled = useRef(false);
-  /** Name captured during sign-up, so onboarding never has to ask for it again. */
-  const pendingSignupName = useRef("");
-
-  // True cloud-sync state. Previously "signed in but not yet loaded" and "signed in
-  // but the load failed" were both indistinguishable from "guest".
-  const syncing = !!user && (cloudStatus === "idle" || cloudStatus === "loading");
-  const syncFailed = !!user && cloudStatus === "error";
-  const setupDone = setupComplete || syncFailed;
-  const signedIn = !!user && (setupDone || syncing);
-
-  const buildCloudState = useCallback((): UserState => ({
-    balance,
-    holdings,
-    transactions,
-    profile,
-    setupComplete: true,
-    watchlists,
-    prefs: {
-      homeRange,
-      filter,
-      sort,
-      sortDir,
-      changeDisplay,
-      viewMode,
-      theme,
-      activeWatchlist,
-      pinnedSymbols,
-      customOrders,
-      detailRanges,
-    },
-  }), [
-    balance, holdings, transactions, profile, watchlists,
-    homeRange, filter, sort, sortDir, changeDisplay, viewMode, theme,
-    activeWatchlist, pinnedSymbols, customOrders, detailRanges,
-  ]);
-
-  const applyPrefs = useCallback((prefs: UserPrefs, lists: Watchlist[]) => {
-    setHomeRange(prefs.homeRange as TimeRange);
-    setFilter(prefs.filter as FilterMode);
-    setSort(prefs.sort as SortMode);
-    setSortDir(prefs.sortDir as SortDir);
-    setChangeDisplay(prefs.changeDisplay as ChangeDisplay);
-    setViewMode(prefs.viewMode as ViewMode);
-    setTheme(prefs.theme === "light" ? "light" : "dark");
-    setPinnedSymbols(prefs.pinnedSymbols);
-    setCustomOrders(prefs.customOrders);
-    const ranges: Record<string, TimeRange> = {};
-    for (const [sym, r] of Object.entries(prefs.detailRanges)) {
-      if (TIME_RANGES.includes(r as TimeRange)) ranges[sym] = r as TimeRange;
-    }
-    setDetailRanges(ranges);
-    const active = lists.some(w => w.id === prefs.activeWatchlist)
-      ? prefs.activeWatchlist
-      : (lists[0]?.id ?? "portfolio");
-    setActiveWatchlist(active);
-  }, []);
-
-  const clearTradeData = useCallback(() => {
-    setBalance(0);
-    setHoldings([]);
-    setTransactions([]);
-  }, []);
-
-  const resetToGuest = useCallback(() => {
-    clearTradeData();
-    setProfile(DEFAULT_PROFILE);
-    setWatchlists(DEFAULT_WATCHLISTS);
-    setActiveWatchlist("portfolio");
-    setPinnedSymbols([]);
-    setCustomOrders({});
-    setDetailRanges({});
-    setHomeRange("1D");
-    setFilter("all");
-    setSort("manual");
-    setSortDir("desc");
-    setChangeDisplay("percent");
-    setViewMode("grid");
-    setNeedsNameSetup(false);
-    setSetupComplete(false);
-    cloudReady.current = false;
-    pendingSignupName.current = "";
-  }, [clearTradeData]);
-
-  const loadCloudState = useCallback(async (next: User) => {
-    cloudReady.current = false;
-    setCloudStatus("loading");
-    const email = next.email ?? "";
-    // Identity comes from the Auth user, not Firestore. Seed it up front so a
-    // failed cloud read can't leave the account page blank.
-    const authName = next.displayName || pendingSignupName.current;
-    setProfile(prev => ({
-      ...prev,
-      email: prev.email || email,
-      name: prev.name || authName,
-    }));
-    try {
-      const saved = await loadUserState(next.uid);
-      if (saved?.setupComplete && saved.profile?.name) {
-        if (typeof saved.balance === "number") setBalance(saved.balance);
-        if (Array.isArray(saved.holdings)) setHoldings(saved.holdings as Holding[]);
-        if (Array.isArray(saved.transactions)) setTransactions(saved.transactions as Transaction[]);
-        setProfile({
-          ...DEFAULT_PROFILE,
-          ...saved.profile,
-          email: saved.profile.email || email,
-        });
-        const lists = asWatchlists(saved.watchlists) ?? DEFAULT_WATCHLISTS;
-        setWatchlists(lists);
-        applyPrefs(asPrefs(saved.prefs), lists);
-        const symbols = [...new Set(lists.flatMap(w => w.symbols))];
-        if (symbols.length) {
-          ensureQuotes(symbols)
-            .then(live => setStocks([...live]))
-            .catch(() => {});
-        }
-        setNeedsNameSetup(false);
-        setSetupComplete(true);
-      } else {
-        // The read SUCCEEDED and there is genuinely no completed profile —
-        // this is the only case where onboarding is the right answer.
-        clearTradeData();
-        setProfile({ ...DEFAULT_PROFILE, email, name: authName });
-        setNeedsNameSetup(true);
-        setSetupComplete(false);
-        setPage("account");
-      }
-      cloudReady.current = true;
-      setCloudStatus("ready");
-    } catch (err) {
-      // The read FAILED, so we have no idea what's in the cloud. Treating that as
-      // "new user" is what re-asked for the name and made the app look signed out.
-      // Keep local state, keep the user signed in, and leave writes disabled so we
-      // can't overwrite good cloud data with a blank slate.
-      console.warn("Firestore load failed:", err);
-      cloudReady.current = false;
-      setCloudStatus("error");
-    }
-  }, [applyPrefs, clearTradeData]);
-
-  useEffect(() => {
-    return subscribeAuth(next => {
-      setUser(next);
-      if (!next) {
-        // Firebase emits null once on startup before it resolves a session. Only
-        // clear on a real sign-out, otherwise it wipes the restored guest state.
-        if (authSettled.current) resetToGuest();
-        authSettled.current = true;
-        setCloudStatus("idle");
-        return;
-      }
-      authSettled.current = true;
-      void loadCloudState(next);
-    });
-  }, [resetToGuest, loadCloudState]);
-
-  const retryCloudLoad = useCallback(() => {
-    if (user) void loadCloudState(user);
-  }, [user, loadCloudState]);
-
-  // App drives the auth call so the sign-up name is recorded BEFORE Firebase fires
-  // onAuthStateChanged. Setting it after signUp() resolves is already too late —
-  // the listener has run and built the profile with an empty name.
-  const handleAuth = useCallback(async (
-    mode: "signin" | "signup", email: string, password: string, name: string,
-  ) => {
-    if (mode === "signup") {
-      pendingSignupName.current = name;
-      try {
-        await signUp(email, password, name);
-      } catch (err) {
-        pendingSignupName.current = "";
-        throw err;
-      }
-    } else {
-      await signIn(email, password);
-    }
-  }, []);
-
-  // Surface write failures the same way as read failures instead of only logging.
-  useEffect(() => {
-    onSyncResult(err => setCloudStatus(prev => (err ? "error" : prev === "error" ? "ready" : prev)));
-    return () => onSyncResult(null);
-  }, []);
-
-  // cloudStatus is in the deps so a recovered sync flushes pending local changes
-  // instead of waiting for the next unrelated edit.
-  useEffect(() => {
-    if (!cloudReady.current || !user || !setupComplete) return;
-    saveUserState(user.uid, buildCloudState());
-  }, [buildCloudState, user, setupComplete, cloudStatus]);
-
-  // The cloud write is debounced; make sure it lands if the page is hidden or closed.
-  useEffect(() => {
-    const onHide = () => {
-      if (document.visibilityState === "hidden") flushUserState();
-    };
-    document.addEventListener("visibilitychange", onHide);
-    window.addEventListener("pagehide", flushUserState);
-    return () => {
-      document.removeEventListener("visibilitychange", onHide);
-      window.removeEventListener("pagehide", flushUserState);
-    };
-  }, []);
-
-  const handleOnboarding = useCallback((name: string, selectedSymbols: string[]) => {
-    if (!user) return;
-    const nextProfile: Profile = {
-      ...profile,
-      name,
-      email: user.email ?? profile.email,
-      pic: profile.pic || "",
-    };
-    const lists = buildWatchlistsFromSelection(new Set(selectedSymbols));
-    setProfile(nextProfile);
-    setWatchlists(lists);
-    setActiveWatchlist("portfolio");
-    setPinnedSymbols([]);
-    setCustomOrders({});
-    setDetailRanges({});
-    setHomeRange("1D");
-    setFilter("all");
-    setSort("manual");
-    setSortDir("desc");
-    setChangeDisplay("percent");
-    setViewMode("grid");
-    clearTradeData();
-    setNeedsNameSetup(false);
-    setSetupComplete(true);
-    cloudReady.current = true;
-    pendingSignupName.current = "";
-    saveUserState(user.uid, {
-      balance: 0,
-      holdings: [],
-      transactions: [],
-      profile: nextProfile,
-      setupComplete: true,
-      watchlists: lists,
-      prefs: {
-        ...DEFAULT_PREFS,
-        activeWatchlist: "portfolio",
-      },
-    });
-    ensureQuotes(selectedSymbols)
-      .then(live => setStocks([...live]))
-      .catch(() => {});
-    setPage("home");
-  }, [user, profile, clearTradeData]);
-
-  const handleSignOut = useCallback(async () => {
-    await signOut();
-  }, []);
-
-  const handleDeleteAccount = useCallback(async () => {
-    await deleteAccount();
-  }, []);
-
-  const goSignIn = useCallback(() => {
-    setSelectedSymbol(null);
-    setPage("account");
-  }, []);
-
-  const holdingMap = useMemo(() => {
-    const m = new Map<string, Holding>();
-    holdings.forEach(h => m.set(h.symbol, h));
-    return m;
-  }, [holdings]);
-
-  const portfolioValue = useMemo(
-    () => holdings.reduce((sum, h) => {
-      const stock = stocks.find(s => s.symbol === h.symbol);
-      return sum + (stock ? stock.price * h.shares : 0);
-    }, 0),
-    [holdings, stocks]
-  );
-  const totalCost = useMemo(
-    () => holdings.reduce((sum, h) => sum + h.avgCost * h.shares, 0),
-    [holdings]
-  );
-  const totalProfit = portfolioValue - totalCost;
-
-  const activeList   = watchlists.find(w => w.id === activeWatchlist) ?? watchlists[0];
-  const activeStocks = useMemo(
-    () => stocks.filter(s => activeList.symbols.includes(s.symbol)),
-    [activeList, stocks]
-  );
-
-  const portfolioStocks = useMemo(() => {
-    const rows = holdings
-      .map(h => {
-        const stock = stocks.find(s => s.symbol === h.symbol);
-        return stock ? { stock, holding: h } : null;
-      })
-      .filter((x): x is { stock: StockMeta; holding: Holding } => x != null);
-
-    if (sort === "manual") return rows;
-
-    const rangeDelta = (x: StockMeta) => quoteChangeForRange(x.symbol, homeRange, x);
-    const cmp: Record<Exclude<SortMode, "manual">, (a: StockMeta, b: StockMeta) => number> = {
-      change:    (a, b) => rangeDelta(b).changePercent - rangeDelta(a).changePercent,
-      changeAmt: (a, b) => rangeDelta(b).change - rangeDelta(a).change,
-      price:     (a, b) => b.price - a.price,
-      cap:       (a, b) => b.marketCap - a.marketCap,
-      volume:    (a, b) => b.volume - a.volume,
-      symbol:    (a, b) => b.symbol.localeCompare(a.symbol),
-      name:      (a, b) => b.name.localeCompare(a.name),
-    };
-    rows.sort((a, b) => cmp[sort](a.stock, b.stock));
-    if (sortDir === "asc") rows.reverse();
-    return rows;
-  }, [holdings, stocks, sort, sortDir, homeRange, sparkEpoch]);
-
-  const visibleStocks = useMemo(() => {
-    let s = [...activeStocks];
-    const rangeDelta = (x: StockMeta) => quoteChangeForRange(x.symbol, homeRange, x);
-    const owned = new Set(holdings.map(h => h.symbol));
-
-    if (search) {
-      const q = search.toLowerCase();
-      s = s.filter(x => x.symbol.toLowerCase().includes(q) || x.name.toLowerCase().includes(q));
-    }
-
-    if (filter === "gainers") s = s.filter(x => rangeDelta(x).changePercent > 0);
-    else if (filter === "losers") s = s.filter(x => rangeDelta(x).changePercent < 0);
-    else if (filter === "owned") s = s.filter(x => owned.has(x.symbol));
-
-    if (sort === "manual") {
-      const order = customOrders[activeWatchlist] ?? activeList.symbols;
-      s.sort((a, b) => {
-        const ai = order.indexOf(a.symbol);
-        const bi = order.indexOf(b.symbol);
-        return (ai === -1 ? 9999 : ai) - (bi === -1 ? 9999 : bi);
-      });
-      s.sort((a, b) => {
-        const ap = pinnedSymbols.includes(a.symbol);
-        const bp = pinnedSymbols.includes(b.symbol);
-        if (ap === bp) return 0;
-        return ap ? -1 : 1;
-      });
-    } else if (filter === "movers") {
-      s.sort((a, b) => Math.abs(rangeDelta(b).changePercent) - Math.abs(rangeDelta(a).changePercent));
-    } else {
-      // $/% sorts use the toolbar range (1Y etc.), not always 1D day change
-      const cmp: Record<Exclude<SortMode, "manual">, (a: StockMeta, b: StockMeta) => number> = {
-        change:    (a, b) => rangeDelta(b).changePercent - rangeDelta(a).changePercent,
-        changeAmt: (a, b) => rangeDelta(b).change - rangeDelta(a).change,
-        price:     (a, b) => b.price - a.price,
-        cap:       (a, b) => b.marketCap - a.marketCap,
-        volume:    (a, b) => b.volume - a.volume,
-        symbol:    (a, b) => b.symbol.localeCompare(a.symbol),
-        name:      (a, b) => b.name.localeCompare(a.name),
-      };
-      s.sort(cmp[sort]);
-      if (sortDir === "asc") s.reverse();
-    }
-
-    return s;
-  }, [activeStocks, search, filter, sort, sortDir, customOrders, activeWatchlist, pinnedSymbols, activeList.symbols, homeRange, sparkEpoch, holdings]);
-
-  const selectedStock = selectedSymbol ? stocks.find(s => s.symbol === selectedSymbol) ?? null : null;
-
-  const allStocksList = watchlists.find(w => w.id === "portfolio");
-  const allStocksMeta = useMemo(
-    () => stocks.filter(s => (allStocksList?.symbols ?? ALL_SYMBOLS).includes(s.symbol)),
-    [allStocksList, stocks]
-  );
-  const gainCount = allStocksMeta.filter(s => s.changePercent > 0).length;
-  const lossCount = allStocksMeta.filter(s => s.changePercent < 0).length;
-
-  const createWatchlist = useCallback((name: string) => {
-    const id = "wl-" + name.toLowerCase().replace(/\s+/g, "-") + "-" + Date.now();
-    setWatchlists(prev => [...prev, { id, name, symbols: [] }]);
-  }, []);
-
-  const deleteWatchlist = useCallback((id: string) => {
-    setWatchlists(prev => prev.filter(w => w.id !== id));
-    if (activeWatchlist === id) setActiveWatchlist("portfolio");
-  }, [activeWatchlist]);
-
-  const renameWatchlist = useCallback((id: string, name: string) => {
-    setWatchlists(prev => prev.map(w => (w.id === id ? { ...w, name } : w)));
-  }, []);
-
-  const reorderWatchlists = useCallback((fromId: string, toId: string) => {
-    setWatchlists(prev => {
-      const fi = prev.findIndex(w => w.id === fromId);
-      const ti = prev.findIndex(w => w.id === toId);
-      if (fi < 0 || ti < 0 || fi === ti) return prev;
-      const next = [...prev];
-      const [moved] = next.splice(fi, 1);
-      next.splice(ti, 0, moved);
-      return next;
-    });
-  }, []);
-
+  /** Watchlist membership plus a quote fetch for newly added tickers. */
   const toggleWatchlist = useCallback((watchlistId: string, symbol: string) => {
-    setWatchlists(prev => {
-      const target = prev.find(w => w.id === watchlistId);
-      if (!target) return prev;
-      const removing = target.symbols.includes(symbol);
+    prefs.toggleWatchlist(watchlistId, symbol);
+    void quotes.ensure([symbol]);
+  }, [prefs, quotes]);
 
-      let next = prev.map(w => {
-        if (w.id !== watchlistId) return w;
-        return {
-          ...w,
-          symbols: removing
-            ? w.symbols.filter(s => s !== symbol)
-            : [...w.symbols, symbol],
-        };
-      });
-
-      if (!removing) {
-        // Adding anywhere also ensures it's in All Stocks
-        next = next.map(w => {
-          if (w.id !== "portfolio" || w.symbols.includes(symbol)) return w;
-          return { ...w, symbols: [...w.symbols, symbol] };
-        });
-      } else if (watchlistId === "portfolio") {
-        // Removing from All Stocks removes from every watchlist
-        next = next.map(w => ({ ...w, symbols: w.symbols.filter(s => s !== symbol) }));
-      } else {
-        // Removed from a user list — if gone from all user lists, drop from All Stocks too
-        const stillInUserList = next.some(w => w.id !== "portfolio" && w.symbols.includes(symbol));
-        if (!stillInUserList) {
-          next = next.map(w =>
-            w.id === "portfolio" ? { ...w, symbols: w.symbols.filter(s => s !== symbol) } : w
-          );
-        }
-      }
-
-      return next;
+  const setDetailRange = useCallback((symbol: string, r: TimeRange) => {
+    prefs.setDetailRange(symbol, r, () => {
+      prefetchSparklines([symbol], r).catch(() => {});
     });
-    // Load live quote for newly added tickers from search
-    ensureQuotes([symbol])
-      .then(live => setStocks([...live]))
-      .catch(() => {});
-  }, []);
+  }, [prefs]);
 
-  const togglePin = useCallback((symbol: string) => {
-    setPinnedSymbols(prev => prev.includes(symbol) ? prev.filter(s => s !== symbol) : [...prev, symbol]);
-  }, []);
+  const selectSymbol = useCallback((symbol: string) => {
+    setSelectedSymbol(symbol);
+    void quotes.ensure([symbol], true);
+  }, [quotes]);
 
-  const hydrateStocks = useCallback((live: StockMeta[]) => {
-    setStocks([...live]);
-    setSparkEpoch(e => e + 1);
-  }, []);
-
+  /** Search result chosen: show it, and keep it in All Stocks so it stays available. */
   const openSymbol = useCallback(async (symbol: string) => {
     setSearch("");
     setSelectedSymbol(symbol);
     setPage("home");
-    // Ensure searchable tickers land in All Stocks so they stay available
-    setWatchlists(prev => prev.map(w => {
-      if (w.id !== "portfolio" || w.symbols.includes(symbol)) return w;
-      return { ...w, symbols: [...w.symbols, symbol] };
-    }));
-    try {
-      const live = await ensureQuotes([symbol]);
-      setStocks([...live]);
-      setDataStatus("live");
-      const r = detailRanges[symbol] ?? "1D";
-      prefetchSparklines([symbol], r).catch(() => {});
-    } catch {
-      /* keep whatever quote we have */
-    }
-  }, [detailRanges]);
+    prefs.ensureInAllStocks(symbol);
+    await quotes.ensure([symbol], true);
+    prefetchSparklines([symbol], detailRanges[symbol] ?? "1D").catch(() => {});
+  }, [prefs, quotes, detailRanges]);
 
-  const selectSymbol = useCallback((symbol: string) => {
-    setSelectedSymbol(symbol);
-    ensureQuotes([symbol])
-      .then(live => { setStocks([...live]); setDataStatus("live"); })
-      .catch(() => {});
-  }, []);
+  const handleOnboarding = useCallback((name: string, selectedSymbols: string[]) => {
+    completeOnboarding(name, selectedSymbols, buildWatchlistsFromSelection(new Set(selectedSymbols)));
+  }, [completeOnboarding]);
 
-  const setDetailRange = useCallback((symbol: string, r: TimeRange) => {
-    setDetailRanges(prev => (prev[symbol] === r ? prev : { ...prev, [symbol]: r }));
-    prefetchSparklines([symbol], r).catch(() => {});
+  const goToPage = (p: AppPage) => {
+    setPage(p);
+    setSelectedSymbol(null);
+  };
+
+  const goSignIn = useCallback(() => {
+    setSelectedSymbol(null);
+    setPage("account");
   }, []);
 
   const handleDragStart = useCallback((symbol: string) => { dragSymbolRef.current = symbol; }, []);
@@ -633,88 +137,42 @@ export default function App() {
       order.splice(ti, 0, from);
       return { ...prev, [activeWatchlist]: order };
     });
-  }, [dragOver, activeWatchlist, activeList.symbols]);
+  }, [dragOver, activeWatchlist, activeList.symbols, setCustomOrders]);
 
-  const deposit = useCallback((amount: number) => {
-    setBalance(b => b + amount);
-    setTransactions(prev => [{
-      id: "tx-" + Date.now(),
-      type: "deposit",
-      amount,
-      timestamp: Date.now(),
-    }, ...prev]);
-  }, []);
+  // ─── Derived views ──────────────────────────────────────────────────────────
+  const activeStocks = useMemo(
+    () => stocks.filter(s => activeList.symbols.includes(s.symbol)),
+    [activeList, stocks],
+  );
 
-  const buyShares = useCallback((symbol: string, shares: number, price: number) => {
-    const cost = shares * price;
-    setBalance(b => b - cost);
-    setHoldings(prev => {
-      const existing = prev.find(h => h.symbol === symbol);
-      if (!existing) return [...prev, { symbol, shares, avgCost: price }];
-      const totalShares = existing.shares + shares;
-      const avgCost = (existing.avgCost * existing.shares + price * shares) / totalShares;
-      return prev.map(h => h.symbol === symbol ? { symbol, shares: totalShares, avgCost } : h);
-    });
-    setTransactions(prev => [{
-      id: "tx-" + Date.now(),
-      type: "buy",
-      amount: cost,
-      symbol,
-      shares,
-      price,
-      timestamp: Date.now(),
-    }, ...prev]);
-  }, []);
+  const portfolioStocks = useMemo(
+    // sparkEpoch participates because range comparators read cached history.
+    () => sortHoldingRows(buildHoldingRows(holdings, stocks), sort, sortDir, homeRange),
+    [holdings, stocks, sort, sortDir, homeRange, sparkEpoch],
+  );
 
-  const sellShares = useCallback((symbol: string, shares: number, price: number) => {
-    const proceeds = shares * price;
-    setBalance(b => b + proceeds);
-    setHoldings(prev => prev.flatMap(h => {
-      if (h.symbol !== symbol) return [h];
-      const remaining = h.shares - shares;
-      return remaining > 1e-9 ? [{ ...h, shares: remaining }] : [];
-    }));
-    setTransactions(prev => [{
-      id: "tx-" + Date.now(),
-      type: "sell",
-      amount: proceeds,
-      symbol,
-      shares,
-      price,
-      timestamp: Date.now(),
-    }, ...prev]);
-  }, []);
+  const visibleStocks = useMemo(
+    () => screenStocks({
+      stocks: activeStocks, search, filter, sort, sortDir, homeRange,
+      manualOrder: customOrders[activeWatchlist] ?? activeList.symbols,
+      pinnedSymbols,
+      ownedSymbols: new Set(holdings.map(h => h.symbol)),
+    }),
+    [activeStocks, search, filter, sort, sortDir, homeRange, customOrders,
+     activeWatchlist, activeList.symbols, pinnedSymbols, holdings, sparkEpoch],
+  );
 
-  const resetTradeHistory = useCallback(() => {
-    setBalance(0);
-    setHoldings([]);
-    setTransactions([]);
-  }, []);
+  const selectedStock = selectedSymbol ? stocks.find(s => s.symbol === selectedSymbol) ?? null : null;
 
-  const goToPage = (p: AppPage) => {
-    setPage(p);
-    setSelectedSymbol(null);
-  };
+  const allStocksList = watchlists.find(w => w.id === "portfolio");
+  const allStocksMeta = useMemo(
+    () => stocks.filter(s => (allStocksList?.symbols ?? ALL_SYMBOLS).includes(s.symbol)),
+    [allStocksList, stocks],
+  );
+  const gainCount = allStocksMeta.filter(s => s.changePercent > 0).length;
+  const lossCount = allStocksMeta.filter(s => s.changePercent < 0).length;
 
   const isDraggable = sort === "manual" && page === "home";
-
-  const onSortSelect = useCallback((s: SortMode) => {
-    if (s === sort) {
-      setSortDir(d => (d === "desc" ? "asc" : "desc"));
-    } else {
-      setSort(s);
-      setSortDir("desc");
-    }
-  }, [sort]);
-
-  const onColumnSort = useCallback((s: SortMode) => {
-    if (s === sort) {
-      setSortDir(d => (d === "asc" ? "desc" : "asc"));
-    } else {
-      setSort(s);
-      setSortDir("asc");
-    }
-  }, [sort]);
 
   const sharedCardProps = (stock: StockMeta, holding?: Holding) => ({
     stock, range: homeRange, watchlists,
@@ -1035,7 +493,7 @@ export default function App() {
       {needsNameSetup && user && (
         <OnboardingDialog
           email={profile.email || user.email || ""}
-          initialName={profile.name || pendingSignupName.current}
+          initialName={profile.name}
           onComplete={handleOnboarding}
         />
       )}
