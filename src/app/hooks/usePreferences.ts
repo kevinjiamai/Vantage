@@ -40,6 +40,8 @@ export interface Preferences {
   onColumnSort: (s: SortMode) => void;
   togglePin: (symbol: string) => void;
   createWatchlist: (name: string) => void;
+  /** Create a list from imported symbols; returns the new list id. */
+  importWatchlist: (name: string, symbols: string[]) => string;
   deleteWatchlist: (id: string) => void;
   renameWatchlist: (id: string, name: string) => void;
   reorderWatchlists: (fromId: string, toId: string) => void;
@@ -94,6 +96,25 @@ export function usePreferences(): Preferences {
   const createWatchlist = useCallback((name: string) => {
     const id = "wl-" + name.toLowerCase().replace(/\s+/g, "-") + "-" + Date.now();
     setWatchlists(prev => [...prev, { id, name, symbols: [] }]);
+  }, []);
+
+  /**
+   * Create a list from an imported symbol set and return its id.
+   * Symbols are unioned into All Stocks in the same update, which is the
+   * invariant toggleWatchlist maintains one symbol at a time.
+   */
+  const importWatchlist = useCallback((name: string, symbols: string[]) => {
+    const id = "wl-import-" + Date.now();
+    const unique = [...new Set(symbols)];
+    setWatchlists(prev => {
+      const withList = [...prev, { id, name, symbols: unique }];
+      return withList.map(w => {
+        if (w.id !== "portfolio") return w;
+        const added = unique.filter(sym => !w.symbols.includes(sym));
+        return added.length ? { ...w, symbols: [...w.symbols, ...added] } : w;
+      });
+    });
+    return id;
   }, []);
 
   const deleteWatchlist = useCallback((id: string) => {
@@ -204,7 +225,7 @@ export function usePreferences(): Preferences {
     viewMode, setViewMode, watchlists, activeWatchlist, setActiveWatchlist,
     pinnedSymbols, customOrders, activeList,
     setDetailRange, onSortSelect, onColumnSort, togglePin,
-    createWatchlist, deleteWatchlist, renameWatchlist, reorderWatchlists,
+    createWatchlist, importWatchlist, deleteWatchlist, renameWatchlist, reorderWatchlists,
     toggleWatchlist, setCustomOrders, ensureInAllStocks,
     apply, reset, setWatchlists,
   };

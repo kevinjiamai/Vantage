@@ -1,10 +1,12 @@
-import { MoreHorizontal, Plus } from "lucide-react";
+import { FileUp, MoreHorizontal, Plus } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { DialogShell } from "./common";
+import { ImportWatchlistDialog } from "./ImportWatchlistDialog";
 import { WatchlistItemMenu } from "./menus";
 
 import { R } from "../lib/format";
 import { type Watchlist } from "../types";
+import type { StockMeta } from "../lib/stocks";
 
 export function SidebarItem({
   label, count, active, onClick, className = "",
@@ -28,18 +30,20 @@ export function SidebarItem({
 }
 
 export function WatchlistSidebar({
-  watchlists, activeId, onSelect, onCreate, onDelete, onRename, onReorder, open,
+  watchlists, activeId, onSelect, onCreate, onImport, onDelete, onRename, onReorder, open,
 }: {
   watchlists: Watchlist[];
   activeId: string;
   onSelect: (id: string) => void;
   onCreate: (name: string) => void;
+  onImport: (name: string, symbols: string[], stocks: StockMeta[]) => void;
   onDelete: (id: string) => void;
   onRename: (id: string, name: string) => void;
   onReorder: (fromId: string, toId: string) => void;
   open: boolean;
 }) {
   const [creating, setCreating] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [name, setName] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
   const [menuFor, setMenuFor] = useState<string | null>(null);
@@ -87,12 +91,24 @@ export function WatchlistSidebar({
           <div className="text-[9px] font-mono font-semibold tracking-[0.15em] uppercase" style={{ color: "var(--v-ink-dim)" }}>
             Watchlists
           </div>
-          <button
-            className="w-5 h-5 rounded flex items-center justify-center hover:bg-white/10 transition-colors"
-            onClick={() => setCreating(true)}
-          >
-            <Plus size={12} style={{ color: "var(--v-ink-dim)" }} />
-          </button>
+          <div className="flex items-center gap-0.5">
+            <button
+              className="w-5 h-5 rounded flex items-center justify-center hover:bg-white/10 transition-colors"
+              onClick={() => setImporting(true)}
+              title="Import from a Yahoo Finance CSV export"
+              aria-label="Import watchlist"
+            >
+              <FileUp size={11} style={{ color: "var(--v-ink-dim)" }} />
+            </button>
+            <button
+              className="w-5 h-5 rounded flex items-center justify-center hover:bg-white/10 transition-colors"
+              onClick={() => setCreating(true)}
+              title="New watchlist"
+              aria-label="New watchlist"
+            >
+              <Plus size={12} style={{ color: "var(--v-ink-dim)" }} />
+            </button>
+          </div>
         </div>
 
         {allStocks && (
@@ -177,6 +193,13 @@ export function WatchlistSidebar({
           </div>
         )}
       </div>
+
+      {importing && (
+        <ImportWatchlistDialog
+          onClose={() => setImporting(false)}
+          onImport={onImport}
+        />
+      )}
 
       {confirmDelete && (
         <DialogShell

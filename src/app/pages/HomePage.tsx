@@ -32,7 +32,7 @@ export function HomePage({
   onSelectWatchlist, onOpenSymbol, onToggleWatchlist,
 }: HomePageProps) {
   const {
-    watchlists, activeWatchlist, createWatchlist, deleteWatchlist,
+    watchlists, activeWatchlist, createWatchlist, importWatchlist, deleteWatchlist,
     renameWatchlist, reorderWatchlists, homeRange, setHomeRange,
     filter, setFilter, sort, sortDir, onSortSelect, onColumnSort,
     changeDisplay, setChangeDisplay, viewMode, setViewMode,
@@ -46,6 +46,11 @@ export function HomePage({
         open={sidebarOpen}
         onSelect={onSelectWatchlist}
         onCreate={createWatchlist}
+        onImport={(name, symbols, stocks) => {
+          const id = importWatchlist(name, symbols);
+          quotes.hydrate(stocks);
+          onSelectWatchlist(id);
+        }}
         onDelete={deleteWatchlist}
         onRename={renameWatchlist}
         onReorder={reorderWatchlists}

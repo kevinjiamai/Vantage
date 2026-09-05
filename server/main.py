@@ -45,7 +45,7 @@ app.add_middleware(
 
 MAX_SYMBOLS = 40
 MAX_SEARCH_LEN = 64
-_SYMBOL_RE = re.compile(r"^[A-Za-z0-9.^_-]{1,15}$")
+_SYMBOL_RE = re.compile(r"^[A-Za-z0-9.^=_-]{1,15}$")  # "=" admits futures (ES=F)
 
 
 def _normalize_symbol(symbol: str) -> str:

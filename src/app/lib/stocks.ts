@@ -370,16 +370,29 @@ export async function fetchQuotes(symbols: string[] = ALL_SYMBOLS): Promise<Stoc
   return STOCKS_META;
 }
 
+/** Server rejects a longer symbol list outright, so requests are split at this size. */
+export const QUOTE_BATCH_SIZE = 40;
+
+async function fetchQuoteBatch(batch: string[]): Promise<Map<string, Record<string, unknown>>> {
+  const res = await fetch(apiUrl(`/api/quotes?symbols=${encodeURIComponent(batch.join(","))}`));
+  if (!res.ok) throw new Error(`Quote fetch failed (${res.status})`);
+  const json = await res.json();
+  const quotes: Record<string, unknown>[] = json?.quotes ?? [];
+  return new Map(quotes.map(q => [String(q.symbol), q]));
+}
+
 /** Fetch only the given symbols and merge into the live snapshot. */
 export async function mergeQuotes(symbols: string[]): Promise<StockMeta[]> {
   const unique = [...new Set(symbols.map(s => s.trim()).filter(Boolean))];
   if (!unique.length) return STOCKS_META;
 
-  const res = await fetch(apiUrl(`/api/quotes?symbols=${encodeURIComponent(unique.join(","))}`));
-  if (!res.ok) throw new Error(`Quote fetch failed (${res.status})`);
-  const json = await res.json();
-  const quotes: Record<string, unknown>[] = json?.quotes ?? [];
-  const bySym = new Map(quotes.map(q => [String(q.symbol), q]));
+  const bySym = new Map<string, Record<string, unknown>>();
+  // Batches run in series: the backend fans each one out to Yahoo already, and
+  // overlapping requests trip its rate limiter.
+  for (let i = 0; i < unique.length; i += QUOTE_BATCH_SIZE) {
+    const batch = await fetchQuoteBatch(unique.slice(i, i + QUOTE_BATCH_SIZE));
+    for (const [sym, q] of batch) bySym.set(sym, q);
+  }
 
   const existing = new Map(STOCKS_META.map(s => [s.symbol, s]));
   for (const sym of unique) {
@@ -392,6 +405,40 @@ export async function mergeQuotes(symbols: string[]): Promise<StockMeta[]> {
   lastQuotesFreshness = freshnessFrom(STOCKS_META);
   persistQuotes(STOCKS_META);
   return STOCKS_META;
+}
+
+export interface ResolvedSymbols {
+  /** Symbols the backend could price. */
+  found: string[];
+  /** Symbols that came back with no price — delisted, or not a Yahoo ticker. */
+  missing: string[];
+  stocks: StockMeta[];
+}
+
+/**
+ * Price a candidate symbol list, reporting which ones Yahoo actually knows.
+ * Progress is reported per batch so a long import can show movement.
+ */
+export async function resolveSymbols(
+  symbols: string[],
+  onProgress?: (done: number, total: number) => void,
+): Promise<ResolvedSymbols> {
+  const unique = [...new Set(symbols.map(s => s.trim()).filter(Boolean))];
+  if (!unique.length) return { found: [], missing: [], stocks: STOCKS_META };
+
+  for (let i = 0; i < unique.length; i += QUOTE_BATCH_SIZE) {
+    await mergeQuotes(unique.slice(i, i + QUOTE_BATCH_SIZE));
+    onProgress?.(Math.min(i + QUOTE_BATCH_SIZE, unique.length), unique.length);
+  }
+
+  const priced = new Map(STOCKS_META.map(s => [s.symbol, s.price]));
+  const found: string[] = [];
+  const missing: string[] = [];
+  for (const sym of unique) {
+    if ((priced.get(sym) ?? 0) > 0) found.push(sym);
+    else missing.push(sym);
+  }
+  return { found, missing, stocks: STOCKS_META };
 }
 
 /** Fetch symbols and merge into the live snapshot (for search/detail of any ticker). */
