@@ -4,8 +4,12 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
-import { MessageCircle, Send, X, Sparkles, Trash2 } from "lucide-react";
-import { resetChat, streamChatReply, type ChatContext } from "../lib/gemini";
+import { ByoModelDialog } from "./ByoModelDialog";
+import { MessageCircle, Send, X, Sparkles, Settings, Trash2 } from "lucide-react";
+import {
+  fetchChatStatus, loadByo, saveByo, streamChatReply,
+  type ByoConfig, type ChatContext, type ChatMessage, type ChatQuota, type ChatStatus,
+} from "../lib/chat";
 import { fetchPerformance } from "../lib/stocks";
 
 const G = "#34d399";
@@ -145,6 +149,10 @@ function inlineMd(text: string): ReactNode {
 
 export function VantageChat({ context }: { context: ChatContext }) {
   const [open, setOpen] = useState(false);
+  const [quota, setQuota] = useState<ChatQuota | null>(null);
+  const [status, setStatus] = useState<ChatStatus | null>(null);
+  const [showByo, setShowByo] = useState(false);
+  const [byo, setByo] = useState<ByoConfig | null>(() => loadByo());
   const [performance, setPerformance] = useState<Record<string, number> | undefined>();
   const [perfLoading, setPerfLoading] = useState(false);
   const [input, setInput] = useState("");
@@ -200,6 +208,13 @@ export function VantageChat({ context }: { context: ChatContext }) {
   useEffect(() => {
     if (open) inputRef.current?.focus();
   }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    fetchChatStatus().then(s => { if (!cancelled && s) setStatus(s); });
+    return () => { cancelled = true; };
+  }, [open, showByo]);
 
   // Load range performance once the panel opens. The cold batch takes ~30s for
   // a few hundred symbols, so it must not run on app start; the server caches
@@ -317,38 +332,53 @@ export function VantageChat({ context }: { context: ChatContext }) {
       { id: botId, role: "assistant", text: "" },
     ]);
     setBusy(true);
+    const history: ChatMessage[] = [
+      ...messages.filter(m => m.text)
+        .map(m => ({ role: m.role as "user" | "assistant", content: m.text })),
+      { role: "user" as const, content: text },
+    ];
     try {
-      for await (const partial of streamChatReply(text, chatContext)) {
-        setMessages(prev => prev.map(m => (m.id === botId ? { ...m, text: partial } : m)));
+      let full = "";
+      for await (const ev of streamChatReply(history, chatContext)) {
+        if (ev.type === "token") {
+          full += ev.text;
+          setMessages(prev => prev.map(m => (m.id === botId ? { ...m, text: full } : m)));
+        } else if (ev.type === "meta") {
+          setQuota(ev.quota);
+        } else if (ev.type === "tool" && !full) {
+          setMessages(prev => prev.map(m =>
+            m.id === botId ? { ...m, text: "Checking your watchlist…" } : m));
+        } else if (ev.type === "error") {
+          throw new Error(ev.message);
+        }
+      }
+      if (!full) {
+        setMessages(prev => prev.map(m =>
+          m.id === botId ? { ...m, text: "I couldn't generate a reply. Try again." } : m));
       }
     } catch (err) {
-      console.error("[VantageChat] reply failed:", err);
-      const msg = err instanceof Error ? err.message : "Chat failed";
-      // Match the specific failure: a quota error sent people to the Firebase
-      // console to enable an API that was already on.
-      setError(
-        /\b429\b|quota|rate.?limit/i.test(msg)
-          ? "Gemini's request quota is used up. Try again shortly, or raise the limit in Google AI Studio."
-          : /api-not-enabled|has not been used|is disabled/i.test(msg)
-            ? "Gemini isn’t enabled for this Firebase project. Turn on Firebase AI Logic in the console."
-            : /permission|PERMISSION|unauthor|API key/i.test(msg)
-              ? "Gemini rejected the request as unauthorised. Check the Firebase API key and its restrictions."
-              : /parse|stream/i.test(msg)
-                ? "The reply was cut off mid-stream. Try asking again."
-                : "Something went wrong. Try again in a moment."
-      );
+      // The service reports the actual failure, so it is shown as-is rather
+      // than guessed at from the message text.
+      setError(err instanceof Error ? err.message : "Something went wrong. Try again.");
       setMessages(prev => prev.map(m => (
         m.id === botId && !m.text
-          ? { ...m, text: "I couldn’t complete that reply." }
+          ? { ...m, text: "I couldn't complete that reply." }
           : m
       )));
     } finally {
       setBusy(false);
     }
-  }, [busy, chatContext]);
+  }, [busy, chatContext, messages]);
+
+  const live = quota ?? status;
+  const quotaLabel = byo
+    ? `your model · ${byo.model}`
+    : live
+      ? `${live.tier} · ${Math.max(0, (live.limit ?? 0) - (live.used ?? 0))} of ${live.limit} left today`
+      : "connecting…";
 
   const clear = () => {
-    resetChat();
+    // History is sent with each request, so dropping the messages is the reset.
     setError(null);
     setMessages([{ id: "welcome", role: "assistant", text: WELCOME }]);
   };
@@ -370,6 +400,19 @@ export function VantageChat({ context }: { context: ChatContext }) {
       {open ? <X size={20} strokeWidth={2.5} /> : <MessageCircle size={20} strokeWidth={2.5} />}
     </button>
   );
+
+  // DialogShell sits at z-100; the chat overlay is far above it, so the dialog
+  // needs its own stacking context above the panel it was opened from.
+  const byoDialog = showByo ? (
+    <div style={{ position: "relative", zIndex: Z + 3 }}>
+      <ByoModelDialog
+        current={byo}
+        status={status}
+        onClose={() => setShowByo(false)}
+        onSaved={setByo}
+      />
+    </div>
+  ) : null;
 
   const overlay = open ? (
     <div style={{ position: "fixed", inset: 0, zIndex: Z }} aria-modal="true" role="dialog">
@@ -409,10 +452,18 @@ export function VantageChat({ context }: { context: ChatContext }) {
             <div className="font-mono text-[13px] font-semibold tracking-wide" style={{ color: "var(--v-ink)" }}>
               Vantage AI
             </div>
-            <div className="text-[11px] font-mono" style={{ color: "var(--v-ink-dim)" }}>
-              Gemini · not financial advice
+            <div className="text-[11px] font-mono truncate" style={{ color: "var(--v-ink-dim)" }}>
+              {quotaLabel} · not financial advice
             </div>
           </div>
+          <button
+            type="button"
+            className="w-8 h-8 rounded-lg flex items-center justify-center hover:bg-white/10 transition-colors"
+            onClick={() => setShowByo(true)}
+            title="Connect your own model"
+          >
+            <Settings size={14} style={{ color: byo ? G : "var(--v-ink-dim)" }} />
+          </button>
           <button
             type="button"
             className="w-8 h-8 rounded-lg flex items-center justify-center hover:bg-white/10 transition-colors"
@@ -533,6 +584,7 @@ export function VantageChat({ context }: { context: ChatContext }) {
   return createPortal(
     <>
       {overlay}
+      {byoDialog}
       {fab}
     </>,
     document.body,

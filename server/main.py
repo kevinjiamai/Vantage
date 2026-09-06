@@ -13,7 +13,15 @@ from typing import Any
 
 import numpy as np
 import yfinance as yf
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import StreamingResponse
+
+from auth import (
+    LIMITS, AuthError, check_and_consume, peek_usage, refund, tier_for,
+    usage_key, verify_id_token,
+)
+from llm import BYO_HOSTS, LLM_API_KEY, LLMError, Provider, stream_chat
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Vantage yfinance API")
@@ -40,7 +48,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_CORS_ORIGINS,
     allow_origin_regex=_CORS_ORIGIN_REGEX,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -800,13 +808,8 @@ def _screen_rows(syms: list[str]) -> dict[str, dict[str, Any]]:
     return rows
 
 
-@app.get("/api/screen")
-def screen(
-    symbols: str = Query(..., description="Comma-separated tickers"),
-    where: str = Query("", description="Comma-separated clauses, e.g. rsi14<30,vol_vs_50d>=1.5"),
-    sort: str = Query("", description="Metric to sort by; prefix with - for descending"),
-    limit: int = Query(25, ge=1, le=200),
-):
+def run_screen(symbols: str, where: str = "", sort: str = "", limit: int = 25) -> dict[str, Any]:
+    """Screen logic, callable from the HTTP route and from the chat tool loop."""
     raw = [s for s in symbols.split(",") if s.strip()]
     if not raw:
         raise HTTPException(400, "symbols required")
@@ -859,6 +862,16 @@ def screen(
         "no_data": skipped,
         "truncated": len(matched) > limit,
     }
+
+
+@app.get("/api/screen")
+def screen(
+    symbols: str = Query(..., description="Comma-separated tickers"),
+    where: str = Query("", description="Comma-separated clauses, e.g. rsi14<30,vol_vs_50d>=1.5"),
+    sort: str = Query("", description="Metric to sort by; prefix with - for descending"),
+    limit: int = Query(25, ge=1, le=200),
+):
+    return run_screen(symbols, where, sort, limit)
 
 
 @app.get("/api/screen/metrics")
@@ -1110,12 +1123,8 @@ def _pattern_rows(syms: list[str], pattern: str) -> dict[str, dict[str, Any]]:
     return rows
 
 
-@app.get("/api/patterns")
-def patterns(
-    symbols: str = Query(..., description="Comma-separated tickers"),
-    pattern: str = Query("cup_and_handle"),
-    limit: int = Query(25, ge=1, le=100),
-):
+def run_patterns(symbols: str, pattern: str = "cup_and_handle", limit: int = 25) -> dict[str, Any]:
+    """Pattern detection, callable from the HTTP route and from the chat tool loop."""
     if pattern not in PATTERNS:
         raise HTTPException(400, f"unknown pattern {pattern!r}; try {sorted(PATTERNS)}")
     raw = [s for s in symbols.split(",") if s.strip()]
@@ -1141,6 +1150,15 @@ def patterns(
             "formation as clean. Confirm visually before relying on any of them."
         ),
     }
+
+
+@app.get("/api/patterns")
+def patterns(
+    symbols: str = Query(..., description="Comma-separated tickers"),
+    pattern: str = Query("cup_and_handle"),
+    limit: int = Query(25, ge=1, le=100),
+):
+    return run_patterns(symbols, pattern, limit)
 
 
 @app.get("/api/patterns/list")
@@ -1364,6 +1382,232 @@ def proxy_image(u: str = Query(..., min_length=8, max_length=2000)):
         media_type=ctype,
         headers={"Cache-Control": "public, max-age=3600"},
     )
+
+
+# ─── Chat ──────────────────────────────────────────────────────────────────────
+# The browser talks only to this service. Whichever model backs it is our
+# relationship to manage, not the end user's.
+
+SYSTEM_PROMPT = """You are Vantage AI, an investing assistant inside the Vantage stock app.
+
+Rules:
+- Be concise and practical. Short paragraphs or bullets. Simple markdown.
+- For any question about which stocks meet a condition, or which lead or lag on a
+  measure, call screen_watchlist. Never estimate an indicator yourself.
+- For chart formations, call detect_pattern. Never infer a pattern from prices.
+- Report the coverage a tool returns (how many matched, how many were screened), and
+  never present a ranking over part of the list as if it covered all of it.
+- Report the "flags" on every pattern match. A flagged formation is not a clean one.
+- Do not invent live prices; use the snapshot provided.
+- Always remind the user this is not financial advice."""
+
+CHAT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "screen_watchlist",
+            "description": (
+                "Filter and rank the user's whole watchlist by computed technical "
+                "indicators. Metrics: " + ", ".join(SCREEN_METRICS) + ". Percent metrics "
+                "are already percentages; pct_off_52w_high is negative below the high; "
+                "vol_vs_50d is a multiple (1.5 = 50% above average)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "where": {
+                        "type": "string",
+                        "description": ("Comma-separated clauses, each metric<op>number, op one "
+                                        "of < <= > >= = != . Example: rsi14<30,vol_vs_50d>=1.5"),
+                    },
+                    "sort": {
+                        "type": "string",
+                        "description": "Metric to sort by; prefix with - for descending.",
+                    },
+                    "limit": {"type": "integer", "description": "Max rows (1-200)."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "detect_pattern",
+            "description": (
+                "Scan the watchlist for a chart pattern using bar-by-bar history. "
+                "Patterns: " + ", ".join(PATTERNS) + ". Each match carries a flags array "
+                "explaining why it may be unreliable; report those with the match."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "enum": sorted(PATTERNS)},
+                    "limit": {"type": "integer", "description": "Max matches (1-100)."},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+]
+
+MAX_TOOL_ROUNDS = 3
+MAX_CHAT_SYMBOLS = 400
+
+
+def _run_tool(name: str, args: dict[str, Any], symbols: list[str]) -> dict[str, Any]:
+    joined = ",".join(symbols)
+    try:
+        if name == "screen_watchlist":
+            out = run_screen(
+                joined,
+                where=str(args.get("where") or ""),
+                sort=str(args.get("sort") or ""),
+                limit=int(args.get("limit") or 25),
+            )
+            out["note"] = (
+                f"Ranked {out['matched']} matches out of {out['screened']} tickers screened "
+                f"({out['requested']} requested). State this coverage when reporting a ranking."
+            )
+            return out
+        if name == "detect_pattern":
+            return run_patterns(
+                joined,
+                pattern=str(args.get("pattern") or "cup_and_handle"),
+                limit=int(args.get("limit") or 25),
+            )
+    except HTTPException as exc:
+        return {"error": exc.detail}
+    except Exception as exc:
+        return {"error": f"{name} failed: {exc}"}
+    return {"error": f"unknown tool {name}"}
+
+
+def _sse(event: str, data: Any) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@app.post("/api/chat")
+async def chat(request: Request):
+    body = await request.json()
+    messages_in = body.get("messages") or []
+    if not isinstance(messages_in, list) or not messages_in:
+        raise HTTPException(400, "messages required")
+    symbols = [
+        _normalize_symbol(s) for s in (body.get("symbols") or [])
+        if isinstance(s, str) and s.strip()
+    ][:MAX_CHAT_SYMBOLS]
+
+    uid = None
+    header = request.headers.get("authorization") or ""
+    if header.lower().startswith("bearer "):
+        try:
+            uid = verify_id_token(header[7:].strip()).get("sub")
+        except AuthError as exc:
+            raise HTTPException(401, str(exc))
+
+    byo = body.get("byo") if isinstance(body.get("byo"), dict) else None
+    try:
+        provider = Provider.from_request(byo)
+    except LLMError as exc:
+        raise HTTPException(exc.status or 400, str(exc))
+
+    tier = "byo" if provider.byo else tier_for(uid)
+    key = usage_key(uid, request.client.host if request.client else "unknown")
+    if provider.byo:
+        used, limit = 0, 0          # their key, their budget
+    else:
+        limit = LIMITS.get(tier, LIMITS["anonymous"])
+        allowed, used, limit = check_and_consume(key, limit)
+        if not allowed:
+            raise HTTPException(
+                429,
+                {
+                    "message": (
+                        f"Daily limit reached for the {tier} tier ({limit} questions). "
+                        "It resets at midnight UTC. You can also connect your own model."
+                    ),
+                    "tier": tier, "used": used, "limit": limit,
+                },
+            )
+
+    convo: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for m in messages_in[-20:]:
+        role = m.get("role")
+        content = m.get("content")
+        if role in ("user", "assistant") and isinstance(content, str) and content:
+            convo.append({"role": role, "content": content})
+
+    async def events():
+        produced = False
+        try:
+            yield _sse("meta", {"tier": tier, "used": used, "limit": limit,
+                                "model": provider.model, "byo": provider.byo})
+            for round_no in range(MAX_TOOL_ROUNDS + 1):
+                calls: list[dict[str, Any]] = []
+                assistant_text = ""
+                async for piece in stream_chat(provider, convo, CHAT_TOOLS):
+                    if "text" in piece:
+                        assistant_text += piece["text"]
+                        produced = True
+                        yield _sse("token", {"text": piece["text"]})
+                    elif "tool_calls" in piece:
+                        calls = piece["tool_calls"]
+                if not calls:
+                    break
+                if round_no == MAX_TOOL_ROUNDS:
+                    yield _sse("token", {"text": "\n\nI couldn't finish looking that up."})
+                    break
+
+                convo.append({"role": "assistant", "content": assistant_text or None,
+                              "tool_calls": calls})
+                for call in calls:
+                    fn = call.get("function") or {}
+                    name = fn.get("name") or ""
+                    try:
+                        args = json.loads(fn.get("arguments") or "{}")
+                    except json.JSONDecodeError:
+                        args = {}
+                    yield _sse("tool", {"name": name, "args": args})
+                    result = await run_in_threadpool(_run_tool, name, args, symbols)
+                    convo.append({
+                        "role": "tool",
+                        "tool_call_id": call.get("id") or name,
+                        "content": json.dumps(result, default=str)[:60000],
+                    })
+            yield _sse("done", {"used": used, "limit": limit})
+        except LLMError as exc:
+            if not produced and not provider.byo:
+                refund(key)
+            yield _sse("error", {"message": str(exc), "status": exc.status})
+        except Exception as exc:
+            if not produced and not provider.byo:
+                refund(key)
+            yield _sse("error", {"message": f"chat failed: {exc}"})
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/chat/status")
+def chat_status(request: Request):
+    uid = None
+    header = request.headers.get("authorization") or ""
+    if header.lower().startswith("bearer "):
+        try:
+            uid = verify_id_token(header[7:].strip()).get("sub")
+        except AuthError:
+            uid = None
+    tier = tier_for(uid)
+    key = usage_key(uid, request.client.host if request.client else "unknown")
+    limit = LIMITS.get(tier, LIMITS["anonymous"])
+    return {
+        "tier": tier,
+        "used": peek_usage(key),
+        "limit": limit,
+        "signed_in": bool(uid),
+        "service_model_available": bool(LLM_API_KEY),
+        "byo_hosts": sorted(BYO_HOSTS),
+    }
 
 
 @app.get("/api/health")
