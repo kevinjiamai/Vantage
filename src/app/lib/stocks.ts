@@ -574,6 +574,38 @@ export async function fetchPerformance(
   });
 }
 
+export interface ScreenRow {
+  symbol: string;
+  [metric: string]: number | string | null;
+}
+
+export interface ScreenResult {
+  results: ScreenRow[];
+  matched: number;
+  screened: number;
+  requested: number;
+  no_data: string[];
+  truncated: boolean;
+}
+
+/** Filter and rank symbols by server-computed indicators. */
+export async function fetchScreen(
+  symbols: string[],
+  opts: { where?: string; sort?: string; limit?: number } = {},
+): Promise<ScreenResult> {
+  const unique = [...new Set(symbols.map(s => s.trim()).filter(Boolean))];
+  const qs = new URLSearchParams({ symbols: unique.join(",") });
+  if (opts.where) qs.set("where", opts.where);
+  if (opts.sort) qs.set("sort", opts.sort);
+  if (opts.limit) qs.set("limit", String(opts.limit));
+  const res = await fetch(apiUrl(`/api/screen?${qs.toString()}`));
+  if (!res.ok) {
+    const detail = await res.json().catch(() => null);
+    throw new Error(detail?.detail ?? `Screen failed (${res.status})`);
+  }
+  return res.json();
+}
+
 export async function searchStocks(query: string): Promise<SearchResult[]> {
   const q = query.trim();
   if (!q) return [];

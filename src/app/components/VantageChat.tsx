@@ -324,9 +324,19 @@ export function VantageChat({ context }: { context: ChatContext }) {
     } catch (err) {
       console.error("[VantageChat] reply failed:", err);
       const msg = err instanceof Error ? err.message : "Chat failed";
-      setError(msg.includes("API") || msg.includes("permission") || msg.includes("PERMISSION")
-        ? "Gemini isn’t available yet. Check Firebase AI Logic is enabled for this project."
-        : "Something went wrong. Try again in a moment.");
+      // Match the specific failure: a quota error sent people to the Firebase
+      // console to enable an API that was already on.
+      setError(
+        /\b429\b|quota|rate.?limit/i.test(msg)
+          ? "Gemini's request quota is used up. Try again shortly, or raise the limit in Google AI Studio."
+          : /api-not-enabled|has not been used|is disabled/i.test(msg)
+            ? "Gemini isn’t enabled for this Firebase project. Turn on Firebase AI Logic in the console."
+            : /permission|PERMISSION|unauthor|API key/i.test(msg)
+              ? "Gemini rejected the request as unauthorised. Check the Firebase API key and its restrictions."
+              : /parse|stream/i.test(msg)
+                ? "The reply was cut off mid-stream. Try asking again."
+                : "Something went wrong. Try again in a moment."
+      );
       setMessages(prev => prev.map(m => (
         m.id === botId && !m.text
           ? { ...m, text: "I couldn’t complete that reply." }

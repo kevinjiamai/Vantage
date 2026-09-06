@@ -669,6 +669,202 @@ def performance(
     }
 
 
+# ─── Screener ──────────────────────────────────────────────────────────────────
+# Indicators are computed here, never by the model: the assistant picks a filter,
+# deterministic code decides what matches.
+
+SCREEN_TTL = 3600.0
+SCREEN_CHUNK = 50
+
+# metric -> human description, surfaced to the model through the tool schema.
+SCREEN_METRICS = {
+    "price":             "last close",
+    "changePercent":     "1-day percent change",
+    "ret_1m":            "percent change over 1 month",
+    "ret_3m":            "percent change over 3 months",
+    "ret_6m":            "percent change over 6 months",
+    "ret_ytd":           "percent change year to date",
+    "ret_1y":            "percent change over 1 year",
+    "pct_off_52w_high":  "percent below the 52-week high (0 = at the high, negative = below)",
+    "pct_off_52w_low":   "percent above the 52-week low",
+    "rsi14":             "14-day RSI (below 30 oversold, above 70 overbought)",
+    "pct_vs_ma50":       "percent above/below the 50-day moving average",
+    "pct_vs_ma200":      "percent above/below the 200-day moving average",
+    "vol_vs_50d":        "latest volume as a multiple of the 50-day average (1.5 = 50% above)",
+    "atr_pct":           "14-day average true range as a percent of price (volatility)",
+    "volume":            "latest session volume",
+}
+
+_OPS = {
+    "<": lambda a, b: a < b, "<=": lambda a, b: a <= b,
+    ">": lambda a, b: a > b, ">=": lambda a, b: a >= b,
+    "=": lambda a, b: a == b, "==": lambda a, b: a == b,
+    "!=": lambda a, b: a != b,
+}
+_CLAUSE_RE = re.compile(r"^([A-Za-z0-9_]+)\s*(<=|>=|!=|==|<|>|=)\s*(-?\d+(?:\.\d+)?)$")
+
+
+def _pct_change(ser, periods: int) -> float | None:
+    if len(ser) <= periods:
+        return None
+    a, b = _num(ser.iloc[-periods - 1]), _num(ser.iloc[-1])
+    return (b / a - 1.0) * 100.0 if a and a > 0 and b is not None else None
+
+
+def _indicators(close, high, low, vol) -> dict[str, Any] | None:
+    """Indicator snapshot from ~2y of daily bars. None when there is too little data."""
+    if len(close) < 30:
+        return None
+    last = _num(close.iloc[-1])
+    if not last or last <= 0:
+        return None
+
+    out: dict[str, Any] = {"price": last, "volume": _num(vol.iloc[-1]) or 0.0}
+    out["changePercent"] = _pct_change(close, 1)
+    for key, periods in (("ret_1m", 21), ("ret_3m", 63), ("ret_6m", 126), ("ret_1y", 252)):
+        out[key] = _pct_change(close, periods)
+
+    ytd = close[close.index >= f"{close.index[-1].year}-01-01"]
+    if len(ytd) >= 2:
+        first = _num(ytd.iloc[0])
+        out["ret_ytd"] = (last / first - 1.0) * 100.0 if first and first > 0 else None
+    else:
+        out["ret_ytd"] = None
+
+    window = min(len(close), 252)
+    hi52, lo52 = _num(high.iloc[-window:].max()), _num(low.iloc[-window:].min())
+    out["pct_off_52w_high"] = (last / hi52 - 1.0) * 100.0 if hi52 else None
+    out["pct_off_52w_low"] = (last / lo52 - 1.0) * 100.0 if lo52 else None
+
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    g, l_ = _num(gain.iloc[-1]), _num(loss.iloc[-1])
+    if g is None or l_ is None:
+        out["rsi14"] = None
+    elif l_ == 0:
+        out["rsi14"] = 100.0
+    else:
+        out["rsi14"] = 100.0 - 100.0 / (1.0 + g / l_)
+
+    for key, n in (("pct_vs_ma50", 50), ("pct_vs_ma200", 200)):
+        ma = _num(close.iloc[-n:].mean()) if len(close) >= n else None
+        out[key] = (last / ma - 1.0) * 100.0 if ma and ma > 0 else None
+
+    v50 = _num(vol.iloc[-50:].mean()) if len(vol) >= 50 else None
+    out["vol_vs_50d"] = (out["volume"] / v50) if v50 and v50 > 0 else None
+
+    prev = close.shift(1)
+    tr = (high - low).combine((high - prev).abs(), max).combine((low - prev).abs(), max)
+    atr = _num(tr.iloc[-14:].mean()) if len(tr) >= 14 else None
+    out["atr_pct"] = (atr / last) * 100.0 if atr else None
+
+    return {k: (round(v, 4) if isinstance(v, float) else v) for k, v in out.items()}
+
+
+def _screen_rows(syms: list[str]) -> dict[str, dict[str, Any]]:
+    """Indicator snapshots for syms, cached per symbol."""
+    import pandas as pd
+
+    rows: dict[str, dict[str, Any]] = {}
+    todo: list[str] = []
+    for sym in syms:
+        cached, fresh = _cache_get(f"scr:{sym}", SCREEN_TTL)
+        if cached is not None and fresh and isinstance(cached, dict):
+            rows[sym] = cached
+        else:
+            todo.append(sym)
+
+    for i in range(0, len(todo), SCREEN_CHUNK):
+        chunk = todo[i:i + SCREEN_CHUNK]
+        try:
+            raw = yf.download(chunk, period="2y", interval="1d", auto_adjust=False,
+                              progress=False, threads=True, group_by="ticker")
+        except Exception:
+            continue
+        for sym in chunk:
+            try:
+                df = raw[sym] if len(chunk) > 1 else raw
+                df = df.dropna(subset=["Close"])
+                if not len(df):
+                    continue
+                ind = _indicators(df["Close"].astype(float), df["High"].astype(float),
+                                  df["Low"].astype(float), df["Volume"].astype(float))
+            except Exception:
+                ind = None
+            if ind:
+                ind["symbol"] = sym
+                _cache_put(f"scr:{sym}", ind)
+                rows[sym] = ind
+    return rows
+
+
+@app.get("/api/screen")
+def screen(
+    symbols: str = Query(..., description="Comma-separated tickers"),
+    where: str = Query("", description="Comma-separated clauses, e.g. rsi14<30,vol_vs_50d>=1.5"),
+    sort: str = Query("", description="Metric to sort by; prefix with - for descending"),
+    limit: int = Query(25, ge=1, le=200),
+):
+    raw = [s for s in symbols.split(",") if s.strip()]
+    if not raw:
+        raise HTTPException(400, "symbols required")
+    if len(raw) > MAX_PERF_SYMBOLS:
+        raise HTTPException(400, f"max {MAX_PERF_SYMBOLS} symbols")
+    syms = list(dict.fromkeys(_normalize_symbol(s) for s in raw))
+
+    clauses = []
+    for part in (c.strip() for c in where.split(",")):
+        if not part:
+            continue
+        m = _CLAUSE_RE.match(part)
+        if not m:
+            raise HTTPException(400, f"bad clause {part!r}; expected metric<op>number")
+        metric, op, value = m.group(1), m.group(2), float(m.group(3))
+        if metric not in SCREEN_METRICS:
+            raise HTTPException(400, f"unknown metric {metric!r}")
+        clauses.append((metric, op, value))
+
+    sort_key, desc = sort.lstrip("-"), sort.startswith("-")
+    if sort_key and sort_key not in SCREEN_METRICS:
+        raise HTTPException(400, f"unknown sort metric {sort_key!r}")
+
+    rows = _screen_rows(syms)
+
+    matched, skipped = [], []
+    for sym in syms:
+        row = rows.get(sym)
+        if row is None:
+            skipped.append(sym)
+            continue
+        ok = True
+        for metric, op, value in clauses:
+            v = row.get(metric)
+            # A missing indicator fails the clause rather than passing silently.
+            if v is None or not _OPS[op](v, value):
+                ok = False
+                break
+        if ok:
+            matched.append(row)
+
+    if sort_key:
+        matched.sort(key=lambda r: (r.get(sort_key) is None, r.get(sort_key) or 0), reverse=desc)
+
+    return {
+        "results": matched[:limit],
+        "matched": len(matched),
+        "screened": len(syms) - len(skipped),
+        "requested": len(syms),
+        "no_data": skipped,
+        "truncated": len(matched) > limit,
+    }
+
+
+@app.get("/api/screen/metrics")
+def screen_metrics():
+    return {"metrics": SCREEN_METRICS, "operators": sorted(_OPS)}
+
+
 @app.get("/api/search")
 def search(q: str = Query(..., min_length=1, max_length=MAX_SEARCH_LEN)):
     query = q.strip()
