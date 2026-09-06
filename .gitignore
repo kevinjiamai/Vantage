@@ -9,9 +9,17 @@ __pycache__/
 .env
 .env.*
 !.env.example
-!.env.production
 *.pem
 *.key
 credentials.json
 serviceAccount*.json
 .vercel
+
+# Local database: contains account rows and bcrypt password hashes.
+server/vantage.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Deployment values stay out of the repo; see .env.example for the shape.
+.env.production
