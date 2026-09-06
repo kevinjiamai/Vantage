@@ -358,6 +358,7 @@ export default function App() {
         <VantageChat
           context={{
             signedIn,
+            range: homeRange,
             watchlistSymbols: [...new Set(watchlists.flatMap(w => w.symbols))],
             holdings,
             stocks: stocks.map(s => ({

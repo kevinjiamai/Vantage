@@ -5,7 +5,7 @@ import {
   type ChatSession,
 } from "firebase/ai";
 import { app } from "./firebase";
-import type { StockMeta } from "./stocks";
+import type { StockMeta, TimeRange } from "./stocks";
 
 const ai = getAI(app, { backend: new GoogleAIBackend() });
 
@@ -22,6 +22,9 @@ Rules:
 - Always finish complete sentences and complete every bullet — never cut off mid-thought.
 - Always remind users this is not financial advice and markets involve risk.
 - Prefer tickers and facts grounded in the portfolio/market context provided.
+- When ranking or comparing performance, use only the rows in the market snapshot,
+  and state the period and how many tickers you ranked. Never present a ranking over
+  part of the list as if it covered all of it.
 - If data is missing, say so and ask a clarifying question.
 - Do not invent precise live prices; use the provided snapshot when available.
 - Aim for clear answers; go longer when the user asks for depth.`;
@@ -31,13 +34,28 @@ export interface ChatContext {
   watchlistSymbols: string[];
   holdings: { symbol: string; shares: number; avgCost: number }[];
   stocks: Pick<StockMeta, "symbol" | "name" | "sector" | "price" | "changePercent">[];
+  /** Range the performance figures cover, e.g. "YTD". */
+  range?: TimeRange;
+  /** Percent change over `range`, by symbol. Absent until loaded. */
+  performance?: Record<string, number>;
 }
 
+/**
+ * Cap on rows in the market snapshot. High enough to carry a whole imported
+ * watchlist: ~200 rows is roughly 2.5k tokens against a 1M window, and a
+ * truncated list makes the model rank a sample while sounding authoritative.
+ */
+const MAX_SNAPSHOT_ROWS = 300;
+
 function contextBlock(ctx: ChatContext): string {
+  const perf = ctx.performance;
+  const rangeLabel = ctx.range ?? "1D";
+
   const lines: string[] = [
     `User signed in: ${ctx.signedIn ? "yes" : "no"}`,
-    `Watchlist tickers: ${ctx.watchlistSymbols.slice(0, 40).join(", ") || "(none)"}`,
+    `Watchlist tickers (${ctx.watchlistSymbols.length}): ${ctx.watchlistSymbols.join(", ") || "(none)"}`,
   ];
+
   if (ctx.holdings.length) {
     lines.push(
       "Holdings: " +
@@ -49,20 +67,52 @@ function contextBlock(ctx: ChatContext): string {
   } else {
     lines.push("Holdings: (none)");
   }
+
   if (ctx.stocks.length) {
+    // Sorted by range performance so that if the cap ever bites it keeps the
+    // extremes, which is what ranking questions are about.
+    const ranked = [...ctx.stocks].sort((a, b) => {
+      const pa = perf?.[a.symbol];
+      const pb = perf?.[b.symbol];
+      if (pa === undefined && pb === undefined) return 0;
+      if (pa === undefined) return 1;
+      if (pb === undefined) return -1;
+      return pb - pa;
+    });
+    const shown = ranked.slice(0, MAX_SNAPSHOT_ROWS);
+
+    const pct = (v: number) => `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`;
     lines.push(
-      "Market snapshot: " +
-        ctx.stocks
-          .slice(0, 25)
-          .map(s => {
-            const pct = Number.isFinite(s.changePercent)
-              ? `${s.changePercent >= 0 ? "+" : ""}${s.changePercent.toFixed(2)}%`
-              : "—";
-            return `${s.symbol} $${s.price.toFixed(2)} ${pct} (${s.sector})`;
-          })
-          .join("; ")
+      `Market snapshot (${shown.length} of ${ctx.stocks.length} tickers` +
+        (perf ? `, sorted by ${rangeLabel} change` : "") +
+        "):"
+    );
+    for (const s of shown) {
+      const day = Number.isFinite(s.changePercent) ? pct(s.changePercent) : "—";
+      const r = perf?.[s.symbol];
+      const rangePart = r === undefined ? "" : ` ${rangeLabel} ${pct(r)}`;
+      lines.push(`  ${s.symbol} $${s.price.toFixed(2)} 1D ${day}${rangePart} (${s.sector})`);
+    }
+    if (shown.length < ctx.stocks.length) {
+      lines.push(`  (${ctx.stocks.length - shown.length} more not listed)`);
+    }
+  }
+
+  if (perf) {
+    const missing = ctx.stocks.filter(s => perf[s.symbol] === undefined).map(s => s.symbol);
+    lines.push(
+      `${rangeLabel} performance is available for ${ctx.stocks.length - missing.length} of ` +
+        `${ctx.stocks.length} tickers` +
+        (missing.length ? `; no data for: ${missing.slice(0, 20).join(", ")}` : "") +
+        ". Rank only from the rows above; do not guess for anything absent."
+    );
+  } else {
+    lines.push(
+      "No multi-day performance data is loaded, so only 1-day change is known. " +
+        "Say so rather than ranking by 1-day change when asked about a longer period."
     );
   }
+
   return lines.join("\n");
 }
 
@@ -72,8 +122,10 @@ let chatContextKey = "";
 function ensureChat(ctx: ChatContext): ChatSession {
   const key = JSON.stringify({
     signedIn: ctx.signedIn,
-    watchlistSymbols: ctx.watchlistSymbols.slice(0, 40),
+    watchlistSymbols: ctx.watchlistSymbols,
     holdings: ctx.holdings.slice(0, 20),
+    range: ctx.range,
+    hasPerf: !!ctx.performance,
   });
   if (chat && key === chatContextKey) return chat;
 

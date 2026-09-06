@@ -6,6 +6,7 @@ import {
 import { createPortal } from "react-dom";
 import { MessageCircle, Send, X, Sparkles, Trash2 } from "lucide-react";
 import { resetChat, streamChatReply, type ChatContext } from "../lib/gemini";
+import { fetchPerformance } from "../lib/stocks";
 
 const G = "#34d399";
 const R = "#f87171";
@@ -144,6 +145,8 @@ function inlineMd(text: string): ReactNode {
 
 export function VantageChat({ context }: { context: ChatContext }) {
   const [open, setOpen] = useState(false);
+  const [performance, setPerformance] = useState<Record<string, number> | undefined>();
+  const [perfLoading, setPerfLoading] = useState(false);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -197,6 +200,42 @@ export function VantageChat({ context }: { context: ChatContext }) {
   useEffect(() => {
     if (open) inputRef.current?.focus();
   }, [open]);
+
+  // Load range performance once the panel opens. The cold batch takes ~30s for
+  // a few hundred symbols, so it must not run on app start; the server caches
+  // it per symbol, making every later open fast.
+  //
+  // Staleness is tracked through loadedKey rather than a cleanup flag: the
+  // symbol list is a fresh array on every App render, so a cleanup would
+  // cancel the in-flight request on the very next render (setPerfLoading
+  // alone causes one) and the dedupe guard would then block the retry.
+  const perfKey = `${context.range}:${context.watchlistSymbols.join(",")}`;
+  const loadedKey = useRef<string>("");
+  useEffect(() => {
+    if (!open || !context.range || !context.watchlistSymbols.length) return;
+    if (loadedKey.current === perfKey) return;
+    loadedKey.current = perfKey;
+    const key = perfKey;
+    setPerfLoading(true);
+    fetchPerformance(context.watchlistSymbols, context.range)
+      .then(rows => {
+        if (loadedKey.current !== key) return;
+        setPerformance(Object.fromEntries(rows.map(r => [r.symbol, r.changePercent])));
+      })
+      .catch(() => {
+        // Leave performance undefined: contextBlock then tells the model it
+        // only has 1-day data, which beats ranking on the wrong numbers.
+        if (loadedKey.current === key) loadedKey.current = "";
+      })
+      .finally(() => {
+        if (loadedKey.current === key || loadedKey.current === "") setPerfLoading(false);
+      });
+    // context fields are read through perfKey; adding the array itself would
+    // re-run this on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, perfKey]);
+
+  const chatContext: ChatContext = { ...context, performance };
 
   useEffect(() => {
     if (!open) return;
@@ -279,10 +318,11 @@ export function VantageChat({ context }: { context: ChatContext }) {
     ]);
     setBusy(true);
     try {
-      for await (const partial of streamChatReply(text, context)) {
+      for await (const partial of streamChatReply(text, chatContext)) {
         setMessages(prev => prev.map(m => (m.id === botId ? { ...m, text: partial } : m)));
       }
     } catch (err) {
+      console.error("[VantageChat] reply failed:", err);
       const msg = err instanceof Error ? err.message : "Chat failed";
       setError(msg.includes("API") || msg.includes("permission") || msg.includes("PERMISSION")
         ? "Gemini isn’t available yet. Check Firebase AI Logic is enabled for this project."
@@ -295,7 +335,7 @@ export function VantageChat({ context }: { context: ChatContext }) {
     } finally {
       setBusy(false);
     }
-  }, [busy, context]);
+  }, [busy, chatContext]);
 
   const clear = () => {
     resetChat();

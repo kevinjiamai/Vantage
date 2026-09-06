@@ -340,14 +340,27 @@ export function invalidateHistoryRange(range: TimeRange) {
   }
 }
 
-export async function fetchQuotes(symbols: string[] = ALL_SYMBOLS): Promise<StockMeta[]> {
-  const knownExtras = STOCKS_META.map(s => s.symbol).filter(s => !ALL_SYMBOLS.includes(s));
-  const request = [...new Set([...symbols, ...knownExtras])];
-  const res = await fetch(apiUrl(`/api/quotes?symbols=${encodeURIComponent(request.join(","))}`));
+/** Server rejects a longer symbol list outright, so requests are split at this size. */
+export const QUOTE_BATCH_SIZE = 40;
+
+async function fetchQuoteBatch(batch: string[]): Promise<Map<string, Record<string, unknown>>> {
+  const res = await fetch(apiUrl(`/api/quotes?symbols=${encodeURIComponent(batch.join(","))}`));
   if (!res.ok) throw new Error(`Quote fetch failed (${res.status})`);
   const json = await res.json();
   const quotes: Record<string, unknown>[] = json?.quotes ?? [];
-  const bySym = new Map(quotes.map(q => [String(q.symbol), q]));
+  return new Map(quotes.map(q => [String(q.symbol), q]));
+}
+
+export async function fetchQuotes(symbols: string[] = ALL_SYMBOLS): Promise<StockMeta[]> {
+  const knownExtras = STOCKS_META.map(s => s.symbol).filter(s => !ALL_SYMBOLS.includes(s));
+  const request = [...new Set([...symbols, ...knownExtras])];
+  // knownExtras grows with every imported symbol, so this list outgrows the
+  // server's per-request cap as soon as a watchlist is imported.
+  const bySym = new Map<string, Record<string, unknown>>();
+  for (let i = 0; i < request.length; i += QUOTE_BATCH_SIZE) {
+    const batch = await fetchQuoteBatch(request.slice(i, i + QUOTE_BATCH_SIZE));
+    for (const [sym, q] of batch) bySym.set(sym, q);
+  }
 
   const existing = new Map(STOCKS_META.map(s => [s.symbol, s]));
   const seedSet = new Set(STOCK_SEED.map(s => s.symbol));
@@ -368,17 +381,6 @@ export async function fetchQuotes(symbols: string[] = ALL_SYMBOLS): Promise<Stoc
   lastQuotesFreshness = freshnessFrom(STOCKS_META);
   persistQuotes(STOCKS_META);
   return STOCKS_META;
-}
-
-/** Server rejects a longer symbol list outright, so requests are split at this size. */
-export const QUOTE_BATCH_SIZE = 40;
-
-async function fetchQuoteBatch(batch: string[]): Promise<Map<string, Record<string, unknown>>> {
-  const res = await fetch(apiUrl(`/api/quotes?symbols=${encodeURIComponent(batch.join(","))}`));
-  if (!res.ok) throw new Error(`Quote fetch failed (${res.status})`);
-  const json = await res.json();
-  const quotes: Record<string, unknown>[] = json?.quotes ?? [];
-  return new Map(quotes.map(q => [String(q.symbol), q]));
 }
 
 /** Fetch only the given symbols and merge into the live snapshot. */
@@ -541,6 +543,35 @@ export function quoteChangeForRange(
   const full = getHistory(symbol, range, stock.price);
   if (full.length >= 2) return changeFromPoints(full, day);
   return changeFromPoints(getHistory(symbol, range, stock.price, { resolution: "spark" }), day);
+}
+
+export interface SymbolPerformance {
+  symbol: string;
+  changePercent: number;
+}
+
+/**
+ * Percent change over a range for many symbols in one request.
+ * Backed by a single batched download server-side, so this takes hundreds of
+ * symbols where /api/quotes caps at QUOTE_BATCH_SIZE.
+ */
+export async function fetchPerformance(
+  symbols: string[],
+  range: TimeRange,
+): Promise<SymbolPerformance[]> {
+  const unique = [...new Set(symbols.map(s => s.trim()).filter(Boolean))];
+  if (!unique.length) return [];
+  const qs = new URLSearchParams({ range, symbols: unique.join(",") });
+  const res = await fetch(apiUrl(`/api/performance?${qs.toString()}`));
+  if (!res.ok) throw new Error(`Performance fetch failed (${res.status})`);
+  const json = await res.json();
+  const rows: Record<string, unknown>[] = json?.results ?? [];
+  return rows.flatMap(r => {
+    const pct = r.changePercent;
+    return typeof pct === "number" && Number.isFinite(pct)
+      ? [{ symbol: String(r.symbol), changePercent: pct }]
+      : [];
+  });
 }
 
 export async function searchStocks(query: string): Promise<SearchResult[]> {

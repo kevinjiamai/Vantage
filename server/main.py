@@ -44,6 +44,8 @@ app.add_middleware(
 )
 
 MAX_SYMBOLS = 40
+# One batched download, so this can be far larger than MAX_SYMBOLS.
+MAX_PERF_SYMBOLS = 500
 MAX_SEARCH_LEN = 64
 _SYMBOL_RE = re.compile(r"^[A-Za-z0-9.^=_-]{1,15}$")  # "=" admits futures (ES=F)
 
@@ -154,6 +156,10 @@ HISTORY_TTL = {
 }
 SEARCH_TTL = 300.0
 NEWS_TTL = 300.0
+# Daily bars, so a long TTL is correct; the cold batch is slow (~30s/200 symbols).
+PERFORMANCE_TTL = 3600.0
+# Yahoo returns large batches half-empty; smaller chunks fetch reliably.
+PERF_CHUNK = 50
 
 
 def _cache_load() -> None:
@@ -569,6 +575,98 @@ def history(
     if points:
         _cache_put(cache_key, result)
     return result
+
+
+def _perf_download(syms: list[str], period: str) -> dict[str, dict[str, Any]]:
+    """Percent change per symbol for one chunk. Missing symbols are omitted."""
+    # auto_adjust=False keeps price return, matching what the cards show.
+    # Adjusted closes fold dividends back in and would make the chat quote a
+    # different number than the UI for the same ticker and period.
+    raw_df = yf.download(
+        syms, period=period, interval="1d", auto_adjust=False,
+        progress=False, threads=True,
+    )
+    try:
+        close = raw_df["Close"]
+    except Exception:
+        close = raw_df
+    # download() returns a flat frame for one symbol, a column MultiIndex for many.
+    if len(syms) == 1 and getattr(close, "ndim", 1) == 1:
+        close = close.to_frame(syms[0])
+
+    out: dict[str, dict[str, Any]] = {}
+    cols = getattr(close, "columns", [])
+    for sym in syms:
+        if sym not in cols:
+            continue
+        ser = close[sym].dropna()
+        if len(ser) < 2:
+            continue
+        first, last = _num(ser.iloc[0]), _num(ser.iloc[-1])
+        if not first or first <= 0 or last is None:
+            continue
+        out[sym] = {
+            "symbol": sym,
+            "changePercent": (last / first - 1.0) * 100.0,
+            "change": last - first,
+            "start": first,
+            "end": last,
+        }
+    return out
+
+
+@app.get("/api/performance")
+def performance(
+    symbols: str = Query(..., description="Comma-separated tickers"),
+    # Aliased: the query param is "range", but that name shadows the builtin.
+    range_: str = Query("YTD", alias="range"),
+):
+    """Percent change over a range for many symbols.
+
+    Cached per symbol rather than per request: Yahoo throttles large batches
+    and returns them half-empty, and a whole-response cache would then pin
+    that partial result for the full TTL. Per-symbol entries mean a throttled
+    run only leaves the symbols it missed to be retried by the next call.
+    """
+    if range_ not in RANGE_MAP:
+        raise HTTPException(400, f"unknown range {range_}")
+    raw = [s for s in symbols.split(",") if s.strip()]
+    if not raw:
+        raise HTTPException(400, "symbols required")
+    if len(raw) > MAX_PERF_SYMBOLS:
+        raise HTTPException(400, f"max {MAX_PERF_SYMBOLS} symbols")
+    syms = list(dict.fromkeys(_normalize_symbol(s) for s in raw))
+
+    by_sym: dict[str, dict[str, Any]] = {}
+    to_fetch: list[str] = []
+    for sym in syms:
+        cached, fresh = _cache_get(f"perf:{range_}:{sym}", PERFORMANCE_TTL)
+        if cached is not None and fresh and isinstance(cached, dict):
+            by_sym[sym] = cached
+        else:
+            to_fetch.append(sym)
+
+    # Chunked so one throttled request cannot wipe out the whole result set.
+    for i in range(0, len(to_fetch), PERF_CHUNK):
+        chunk = to_fetch[i:i + PERF_CHUNK]
+        try:
+            fetched = _perf_download(chunk, SPARK_RANGE_MAP[range_]["period"])
+        except Exception:
+            continue
+        for sym, row in fetched.items():
+            _cache_put(f"perf:{range_}:{sym}", row)
+            by_sym[sym] = row
+
+    results = [
+        by_sym.get(sym, {"symbol": sym, "changePercent": None, "error": "no data"})
+        for sym in syms
+    ]
+    return {
+        "range": range_,
+        "results": results,
+        "found": sum(1 for r in results if r.get("changePercent") is not None),
+        "requested": len(syms),
+    }
 
 
 @app.get("/api/search")
