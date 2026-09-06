@@ -606,6 +606,45 @@ export async function fetchScreen(
   return res.json();
 }
 
+export interface PatternMatch {
+  symbol: string;
+  match: boolean;
+  score?: number;
+  pivot?: number;
+  last?: number;
+  pct_to_pivot?: number;
+  /** Reasons this match may be unreliable; empty means it passed every check. */
+  flags?: string[];
+  [k: string]: unknown;
+}
+
+export interface PatternResult {
+  pattern: string;
+  description: string;
+  results: PatternMatch[];
+  matched: number;
+  unflagged: number;
+  screened: number;
+  note: string;
+}
+
+/** Detect a chart pattern across symbols. Detection is server-side and deterministic. */
+export async function fetchPatterns(
+  symbols: string[],
+  pattern: string,
+  limit?: number,
+): Promise<PatternResult> {
+  const unique = [...new Set(symbols.map(s => s.trim()).filter(Boolean))];
+  const qs = new URLSearchParams({ symbols: unique.join(","), pattern });
+  if (limit) qs.set("limit", String(limit));
+  const res = await fetch(apiUrl(`/api/patterns?${qs.toString()}`));
+  if (!res.ok) {
+    const detail = await res.json().catch(() => null);
+    throw new Error(detail?.detail ?? `Pattern scan failed (${res.status})`);
+  }
+  return res.json();
+}
+
 export async function searchStocks(query: string): Promise<SearchResult[]> {
   const q = query.trim();
   if (!q) return [];

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -863,6 +864,288 @@ def screen(
 @app.get("/api/screen/metrics")
 def screen_metrics():
     return {"metrics": SCREEN_METRICS, "operators": sorted(_OPS)}
+
+
+# ─── Patterns ──────────────────────────────────────────────────────────────────
+# Detectors return their measurements and a list of quality flags, never a bare
+# boolean. Numeric criteria alone pass formations that are obviously wrong on
+# sight — a gap-driven "recovery", a leveraged ETN — so the caller has to see
+# why a match might be junk.
+
+PATTERN_TTL = 3600.0
+PATTERN_CHUNK = 50
+
+_LEVERAGED_RE = re.compile(
+    r"\b(?:[23]x|ultra(?:pro|short)?|leveraged|inverse|bull\s*[23]x|bear\s*[23]x|daily\s*[23]x)\b",
+    re.I,
+)
+
+
+# Backstop for the name check, which is only as good as the quote cache.
+_LEVERAGED_TICKERS = {
+    "SOXL", "SOXS", "TQQQ", "SQQQ", "FNGU", "FNGD", "NVDL", "NVDS", "TSLL", "TSLQ",
+    "UPRO", "SPXU", "SPXL", "SPXS", "LABU", "LABD", "YINN", "YANG", "UVXY", "SVXY",
+    "TNA", "TZA", "FAS", "FAZ", "ERX", "ERY", "NUGT", "DUST", "JNUG", "JDST",
+    "BOIL", "KOLD", "UCO", "SCO", "AGQ", "ZSL", "TMF", "TMV", "UDOW", "SDOW",
+    "QLD", "SSO", "UWM", "AAPU", "AAPD", "MSFU", "MSFD", "GGLL", "AMZU", "METU",
+}
+
+
+def _is_leveraged(sym: str) -> bool:
+    if sym in _LEVERAGED_TICKERS:
+        return True
+    with _CACHE_LOCK:
+        entry = _CACHE.get(f"q:{sym}")
+    name = ""
+    if entry and isinstance(entry[1], dict):
+        name = str(entry[1].get("name") or "")
+    return bool(_LEVERAGED_RE.search(name))
+
+
+def _detect_cup_and_handle(c, h, l, v) -> dict[str, Any] | None:
+    """Highest-scoring cup-and-handle in the window, or None.
+
+    Thresholds follow the classic description: a prior advance, a rounded base
+    12-35% deep, a right rim back near the left one, and a shallow handle in the
+    upper third on lighter volume.
+    """
+    n = len(c)
+    if n < 120:
+        return None
+    best = None
+
+    for rim_i in range(max(0, n - 325), n - 35):
+        rim = h[rim_i]
+        if rim < h[max(0, rim_i - 15):rim_i + 1].max():
+            continue
+        pre = c[max(0, rim_i - 250):rim_i + 1]
+        if len(pre) < 40 or pre.min() <= 0 or rim / pre.min() - 1 < 0.30:
+            continue
+
+        bot_i = rim_i + 1 + int(np.argmin(l[rim_i + 1:n]))
+        bottom = l[bot_i]
+        if bottom <= 0:
+            continue
+        depth = (rim - bottom) / rim
+        if not (0.12 <= depth <= 0.35):
+            continue
+        if bot_i - rim_i < 15 or n - bot_i < 15:
+            continue
+
+        cup = l[rim_i:n]
+        roundness = float((cup <= bottom + 0.33 * (rim - bottom)).sum()) / len(cup)
+        if roundness < 0.12:
+            continue
+
+        right_i = bot_i + int(np.argmax(h[bot_i:n]))
+        right_rim = h[right_i]
+        recovery = (right_rim - bottom) / (rim - bottom)
+        if not (0.90 <= recovery <= 1.10) or n - right_i < 5:
+            continue
+
+        handle_low = l[right_i:n].min()
+        h_depth = (right_rim - handle_low) / right_rim
+        h_len = n - right_i
+        if not (0.03 <= h_depth <= 0.12) or not (5 <= h_len <= 50):
+            continue
+        if handle_low < bottom + 0.60 * (rim - bottom):
+            continue
+
+        pivot = h[right_i:n].max()
+        last = c[-1]
+        dist = (pivot - last) / pivot
+        if not (-0.02 <= dist <= 0.10):
+            continue
+
+        cup_v = v[rim_i:right_i].mean()
+        handle_v = v[right_i:n].mean()
+        vol_ratio = float(handle_v / cup_v) if cup_v else None
+        if vol_ratio is not None and vol_ratio > 1.20:
+            continue
+
+        # Biggest single session on the way up: a gap this size is news, not a base.
+        right = c[bot_i:right_i + 1]
+        max_day = float(np.max(right[1:] / right[:-1] - 1.0)) if len(right) > 1 else 0.0
+
+        score = (roundness * 2 + (1 - abs(1 - recovery)) * 2
+                 + (1.2 - (vol_ratio if vol_ratio is not None else 1.2))
+                 + (0.10 - h_depth) * 5 + (0.10 - max(dist, 0.0)) * 5)
+        cand = {
+            "cup_weeks": round((n - rim_i) / 5, 1),
+            "depth_pct": round(depth * 100, 2),
+            "roundness": round(roundness, 3),
+            "recovery_pct": round(recovery * 100, 1),
+            "handle_sessions": int(h_len),
+            "handle_depth_pct": round(h_depth * 100, 2),
+            "handle_volume_ratio": round(vol_ratio, 2) if vol_ratio is not None else None,
+            "pivot": round(float(pivot), 2),
+            "last": round(float(last), 2),
+            "pct_to_pivot": round(dist * 100, 2),
+            "max_single_day_gain_pct": round(max_day * 100, 2),
+            "score": round(float(score), 3),
+        }
+        if best is None or cand["score"] > best["score"]:
+            best = cand
+    return best
+
+
+def _flag_cup(m: dict[str, Any], sym: str) -> list[str]:
+    flags = []
+    if _is_leveraged(sym):
+        flags.append("leveraged_product: daily rebalancing distorts chart patterns")
+    if m["handle_sessions"] < 10:
+        flags.append(f"young_handle: {m['handle_sessions']} sessions, under the 1-2 week norm")
+    if m["depth_pct"] > 33:
+        flags.append(f"deep_cup: {m['depth_pct']}% exceeds the classic 12-33%")
+    if m["max_single_day_gain_pct"] > 15:
+        flags.append(
+            f"gap_recovery: right side includes a {m['max_single_day_gain_pct']}% session, "
+            "so the base may be news-driven rather than rounded"
+        )
+    if m["roundness"] < 0.20:
+        flags.append("shallow_rounding: price spent little time near the lows (V-shaped)")
+    return flags
+
+
+def _detect_flat_base(c, h, l, v) -> dict[str, Any] | None:
+    """A tight sideways range in the upper part of the 52-week range."""
+    n = len(c)
+    if n < 60:
+        return None
+    for weeks in (12, 10, 8, 7, 6, 5):
+        span = weeks * 5
+        if n < span + 10:
+            continue
+        hi, lo = h[-span:].max(), l[-span:].min()
+        if lo <= 0:
+            continue
+        width = (hi - lo) / hi
+        if width > 0.15:
+            continue
+        window = min(n, 252)
+        hi52 = h[-window:].max()
+        if hi52 <= 0 or (hi / hi52) < 0.85:
+            continue
+        last = c[-1]
+        dist = (hi - last) / hi
+        if not (-0.02 <= dist <= 0.08):
+            continue
+        base_v = v[-span:].mean()
+        prior_v = v[-span * 2:-span].mean() if n >= span * 2 else base_v
+        return {
+            "base_weeks": weeks,
+            "width_pct": round(width * 100, 2),
+            "pct_off_52w_high": round((last / hi52 - 1) * 100, 2),
+            "pivot": round(float(hi), 2),
+            "last": round(float(last), 2),
+            "pct_to_pivot": round(dist * 100, 2),
+            "volume_ratio": round(float(base_v / prior_v), 2) if prior_v else None,
+            "score": round(float(1 - width), 3),
+        }
+    return None
+
+
+def _flag_flat(m: dict[str, Any], sym: str) -> list[str]:
+    flags = []
+    if _is_leveraged(sym):
+        flags.append("leveraged_product: daily rebalancing distorts chart patterns")
+    if m["base_weeks"] <= 5:
+        flags.append(
+            f"short_base: {m['base_weeks']} weeks is the shortest this accepts; "
+            "longer bases are more reliable"
+        )
+    if m["width_pct"] > 12:
+        flags.append(f"loose_base: {m['width_pct']}% range is wide for a flat base")
+    return flags
+
+
+PATTERNS = {
+    "cup_and_handle": (_detect_cup_and_handle, _flag_cup,
+                       "Rounded multi-week base with a shallow pullback near the rim."),
+    "flat_base": (_detect_flat_base, _flag_flat,
+                  "Tight sideways range high in the 52-week range."),
+}
+
+
+def _pattern_rows(syms: list[str], pattern: str) -> dict[str, dict[str, Any]]:
+    detect, flag, _ = PATTERNS[pattern]
+    rows: dict[str, dict[str, Any]] = {}
+    todo: list[str] = []
+    for sym in syms:
+        cached, fresh = _cache_get(f"pat:{pattern}:{sym}", PATTERN_TTL)
+        if cached is not None and fresh and isinstance(cached, dict):
+            if cached.get("match"):
+                rows[sym] = cached
+        else:
+            todo.append(sym)
+
+    for i in range(0, len(todo), PATTERN_CHUNK):
+        chunk = todo[i:i + PATTERN_CHUNK]
+        try:
+            raw = yf.download(chunk, period="2y", interval="1d", auto_adjust=False,
+                              progress=False, threads=True, group_by="ticker")
+        except Exception:
+            continue
+        for sym in chunk:
+            found = None
+            try:
+                df = raw[sym] if len(chunk) > 1 else raw
+                df = df.dropna(subset=["Close"])
+                if len(df) >= 60:
+                    found = detect(
+                        df["Close"].astype(float).to_numpy(),
+                        df["High"].astype(float).to_numpy(),
+                        df["Low"].astype(float).to_numpy(),
+                        df["Volume"].astype(float).to_numpy(),
+                    )
+            except Exception:
+                found = None
+            entry = {"symbol": sym, "match": bool(found)}
+            if found:
+                entry.update(found)
+                entry["flags"] = flag(found, sym)
+            _cache_put(f"pat:{pattern}:{sym}", entry)
+            if found:
+                rows[sym] = entry
+    return rows
+
+
+@app.get("/api/patterns")
+def patterns(
+    symbols: str = Query(..., description="Comma-separated tickers"),
+    pattern: str = Query("cup_and_handle"),
+    limit: int = Query(25, ge=1, le=100),
+):
+    if pattern not in PATTERNS:
+        raise HTTPException(400, f"unknown pattern {pattern!r}; try {sorted(PATTERNS)}")
+    raw = [s for s in symbols.split(",") if s.strip()]
+    if not raw:
+        raise HTTPException(400, "symbols required")
+    if len(raw) > MAX_PERF_SYMBOLS:
+        raise HTTPException(400, f"max {MAX_PERF_SYMBOLS} symbols")
+    syms = list(dict.fromkeys(_normalize_symbol(s) for s in raw))
+
+    rows = _pattern_rows(syms, pattern)
+    matches = sorted(rows.values(), key=lambda r: -r.get("score", 0))
+    clean = [m for m in matches if not m.get("flags")]
+    return {
+        "pattern": pattern,
+        "description": PATTERNS[pattern][2],
+        "results": matches[:limit],
+        "matched": len(matches),
+        "unflagged": len(clean),
+        "screened": len(syms),
+        "note": (
+            "Numeric criteria only. Every match carries `flags` naming why it may be "
+            "unreliable; report those alongside the match and never present a flagged "
+            "formation as clean. Confirm visually before relying on any of them."
+        ),
+    }
+
+
+@app.get("/api/patterns/list")
+def patterns_list():
+    return {"patterns": {k: v[2] for k, v in PATTERNS.items()}}
 
 
 @app.get("/api/search")

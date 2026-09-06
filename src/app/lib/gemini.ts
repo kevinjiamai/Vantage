@@ -7,7 +7,7 @@ import {
   type FunctionCall,
 } from "firebase/ai";
 import { app } from "./firebase";
-import { fetchScreen } from "./stocks";
+import { fetchPatterns, fetchScreen } from "./stocks";
 import type { StockMeta, TimeRange } from "./stocks";
 
 const ai = getAI(app, { backend: new GoogleAIBackend() });
@@ -30,8 +30,10 @@ Rules:
   snapshot when the tool can answer it — the snapshot may be partial.
 - Report the coverage the tool gives back (how many matched, how many were screened),
   and never present a ranking over part of the list as if it covered all of it.
-- Chart patterns (cup and handle, double bottom, breakouts) need bar-by-bar history the
-  tool does not expose yet. Say so plainly instead of guessing from indicators.
+- For chart formations, call detect_pattern. Never infer a pattern from prices or
+  indicators. If the pattern asked for is not one the tool supports, say which are.
+- Report the "flags" on every pattern match. A match with flags is not a clean setup,
+  and saying so is more useful than a confident list.
 - If data is missing, say so and ask a clarifying question.
 - Do not invent precise live prices; use the provided snapshot when available.
 - Aim for clear answers; go longer when the user asks for depth.`;
@@ -134,6 +136,33 @@ const SCREEN_METRICS = [
   "vol_vs_50d", "atr_pct", "volume",
 ].join(", ");
 
+const PATTERN_TOOL = {
+  functionDeclarations: [{
+    name: "detect_pattern",
+    description:
+      "Scan the user's watchlist for a chart pattern using bar-by-bar price and volume " +
+      "history. Use this for questions about chart formations. Never judge a pattern " +
+      "from indicators or prices yourself. " +
+      "Patterns: 'cup_and_handle' (rounded multi-week base with a shallow pullback near " +
+      "the rim), 'flat_base' (tight sideways range high in the 52-week range). " +
+      "Every match carries a `flags` array explaining why it may be unreliable — a " +
+      "leveraged product, a gap-driven recovery, a handle that is too young. Report " +
+      "those flags with the match; a flagged formation is not a clean one.",
+    parameters: Schema.object({
+      properties: {
+        pattern: Schema.string({
+          description: "Pattern to scan for: cup_and_handle or flat_base.",
+        }),
+        limit: Schema.number({
+          description: "Maximum matches to return (1-100). Default 25.",
+          nullable: true,
+        }),
+      },
+      optionalProperties: ["limit"],
+    }),
+  }],
+};
+
 const SCREEN_TOOL = {
   functionDeclarations: [{
     name: "screen_watchlist",
@@ -186,9 +215,22 @@ async function runScreen(args: Record<string, unknown>, symbols: string[]) {
   }
 }
 
+async function runPatterns(args: Record<string, unknown>, symbols: string[]) {
+  const pattern = typeof args.pattern === "string" ? args.pattern : "cup_and_handle";
+  try {
+    const res = await fetchPatterns(
+      symbols, pattern, typeof args.limit === "number" ? args.limit : undefined,
+    );
+    return res;
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : "pattern scan failed" };
+  }
+}
+
 async function dispatch(call: FunctionCall, symbols: string[]) {
   const args = (call.args ?? {}) as Record<string, unknown>;
   if (call.name === "screen_watchlist") return runScreen(args, symbols);
+  if (call.name === "detect_pattern") return runPatterns(args, symbols);
   return { error: `unknown tool ${call.name}` };
 }
 
@@ -208,7 +250,7 @@ function ensureChat(ctx: ChatContext): ChatSession {
   const model = getGenerativeModel(ai, {
     model: "gemini-flash-latest",
     systemInstruction: SYSTEM,
-    tools: [SCREEN_TOOL],
+    tools: [SCREEN_TOOL, PATTERN_TOOL],
     generationConfig: {
       temperature: 0.7,
       topP: 0.95,
