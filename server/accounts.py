@@ -18,7 +18,17 @@ from db import User, UserState, session, utcnow
 
 # Generated when unset so local development works out of the box. Sessions then
 # do not survive a restart, which is the right failure for a missing secret.
-SECRET_KEY = os.environ.get("SECRET_KEY", "").strip() or secrets.token_urlsafe(48)
+# 32 bytes is the floor for HS256; PyJWT only warns below it, which would let a
+# weak secret sign every session in production unnoticed.
+MIN_SECRET_BYTES = 32
+
+_configured_secret = os.environ.get("SECRET_KEY", "").strip()
+if _configured_secret and len(_configured_secret.encode()) < MIN_SECRET_BYTES:
+    raise RuntimeError(
+        f"SECRET_KEY must be at least {MIN_SECRET_BYTES} bytes; "
+        "generate one with: openssl rand -base64 48"
+    )
+SECRET_KEY = _configured_secret or secrets.token_urlsafe(48)
 SESSION_DAYS = int(os.environ.get("SESSION_DAYS", "30") or 30)
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
