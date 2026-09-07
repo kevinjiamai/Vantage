@@ -20,7 +20,10 @@ from pydantic import BaseModel
 
 import accounts
 from accounts import LIMITS, AccountError
-from db import consume_usage, init_db, load_state, peek_usage, refund_usage, save_state
+from db import (
+    USING_SQLITE, consume_usage, init_db, load_state, peek_usage, refund_usage,
+    save_state,
+)
 from llm import BYO_HOSTS, LLM_API_KEY, LLMError, Provider, stream_chat
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -1736,7 +1739,13 @@ async def put_state(request: Request):
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "source": "yfinance"}
+    return {
+        "ok": True,
+        "source": "yfinance",
+        # Durability is visible here so a misconfigured deploy is obvious.
+        "storage": "sqlite" if USING_SQLITE else "postgres",
+        "chat_model_configured": bool(LLM_API_KEY),
+    }
 
 
 if __name__ == "__main__":

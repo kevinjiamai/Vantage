@@ -9,7 +9,9 @@
     "api": "server/.venv/bin/python -m uvicorn main:app --app-dir server --reload --host 127.0.0.1 --port 8000",
     "dev:all": "npx concurrently -k -n api,web -c green,cyan \"npm run api\" \"npm run dev\"",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:server": "server/.venv/bin/python -m pytest server/tests -q",
+    "test:all": "vitest run && npm run test:server"
   },
   "dependencies": {
     "@emotion/react": "11.14.0",

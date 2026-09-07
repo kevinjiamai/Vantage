@@ -23,7 +23,22 @@ DATABASE_URL = os.environ.get("DATABASE_URL", _DEFAULT_SQLITE).strip() or _DEFAU
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-_connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+USING_SQLITE = DATABASE_URL.startswith("sqlite")
+
+# Hosted filesystems are ephemeral: on Render, Fly, Cloud Run and friends a
+# SQLite file is wiped by every redeploy. Losing accounts silently weeks later
+# is far worse than refusing to start now, so a hosted process must be explicit.
+_HOSTED_MARKERS = ("RENDER", "DYNO", "FLY_APP_NAME", "K_SERVICE", "WEBSITE_INSTANCE_ID")
+_looks_hosted = any(os.environ.get(marker) for marker in _HOSTED_MARKERS)
+if USING_SQLITE and _looks_hosted and not os.environ.get("ALLOW_EPHEMERAL_SQLITE"):
+    raise RuntimeError(
+        "Refusing to start: this looks like a hosted environment but DATABASE_URL "
+        "is SQLite, whose file does not survive a redeploy. Set DATABASE_URL to a "
+        "Postgres URL, or set ALLOW_EPHEMERAL_SQLITE=1 if losing all accounts on "
+        "every deploy is genuinely what you want."
+    )
+
+_connect_args = {"check_same_thread": False} if USING_SQLITE else {}
 engine = create_engine(DATABASE_URL, connect_args=_connect_args, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 

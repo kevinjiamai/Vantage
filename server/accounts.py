@@ -15,7 +15,7 @@ import bcrypt
 import jwt
 from sqlalchemy import select
 
-from db import User, UserState, session, utcnow
+from db import User, session, utcnow
 
 # Generated when unset so local development works out of the box. Sessions then
 # do not survive a restart, which is the right failure for a missing secret.
@@ -209,10 +209,9 @@ def delete_user(user_id: str) -> None:
         if user is None:
             return
         user.token_epoch += 1
-        # Explicit, so the state row goes regardless of the backend's cascade support.
-        state = s.get(UserState, user_id)
-        if state is not None:
-            s.delete(state)
+        # The state row goes with the user through ON DELETE CASCADE, which both
+        # SQLite (with the pragma db.py sets) and Postgres honour. Deleting it
+        # here as well matched zero rows and only produced a warning.
         s.delete(user)
         s.commit()
 
