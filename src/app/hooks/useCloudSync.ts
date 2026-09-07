@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { User } from "firebase/auth";
 import {
   loadUserState, saveUserState, flushUserState, onSyncResult, subscribeAuth,
-  signIn, signUp, signOut, deleteAccount, DEFAULT_PREFS, type UserState,
-} from "../lib/firebase";
+  signIn, signUp, signOut, deleteAccount, DEFAULT_PREFS,
+  type User, type UserState,
+} from "../lib/account";
 import {
   DEFAULT_PROFILE, asPrefs, asWatchlists, DEFAULT_WATCHLISTS,
   type AppPage, type CloudStatus, type Profile, type Watchlist,
@@ -27,7 +27,7 @@ export interface CloudSync {
   needsNameSetup: boolean;
   handleAuth: (mode: "signin" | "signup", email: string, password: string, name: string) => Promise<void>;
   handleSignOut: () => Promise<void>;
-  handleDeleteAccount: () => Promise<void>;
+  handleDeleteAccount: (password: string) => Promise<void>;
   retry: () => void;
   completeOnboarding: (name: string, symbols: string[], lists: Watchlist[]) => void;
 }
@@ -108,14 +108,14 @@ export function useCloudSync(
     const email = next.email ?? "";
     // Identity comes from the Auth user, not Firestore. Seed it up front so a
     // failed cloud read can't leave the account page blank.
-    const authName = next.displayName || pendingSignupName.current;
+    const authName = next.name || pendingSignupName.current;
     setProfile(prev => ({
       ...prev,
       email: prev.email || email,
       name: prev.name || authName,
     }));
     try {
-      const saved = await loadUserState(next.uid);
+      const saved = await loadUserState();
       if (saved?.setupComplete && saved.profile?.name) {
         portfolio.replace(saved);
         setProfile({
@@ -208,7 +208,7 @@ export function useCloudSync(
   } = prefs;
   useEffect(() => {
     if (!cloudReady.current || !user || !setupComplete) return;
-    saveUserState(user.uid, buildCloudState());
+    saveUserState(buildCloudState());
   }, [
     user, setupComplete, cloudStatus, buildCloudState,
     balance, holdings, transactions, profile, watchlists,
@@ -245,7 +245,7 @@ export function useCloudSync(
     setSetupComplete(true);
     cloudReady.current = true;
     pendingSignupName.current = "";
-    saveUserState(user.uid, {
+    saveUserState({
       balance: 0,
       holdings: [],
       transactions: [],
@@ -263,7 +263,7 @@ export function useCloudSync(
     signedIn, syncFailed, needsNameSetup,
     handleAuth,
     handleSignOut: useCallback(() => signOut(), []),
-    handleDeleteAccount: useCallback(() => deleteAccount(), []),
+    handleDeleteAccount: useCallback((password: string) => deleteAccount(password), []),
     retry, completeOnboarding,
   };
 }

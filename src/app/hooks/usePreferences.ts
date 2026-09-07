@@ -1,6 +1,6 @@
 import { useCallback, useState, type Dispatch, type SetStateAction } from "react";
 import type { TimeRange } from "../lib/stocks";
-import type { UserPrefs } from "../lib/firebase";
+import type { UserPrefs } from "../lib/account";
 import {
   DEFAULT_WATCHLISTS, TIME_RANGES,
   type ChangeDisplay, type FilterMode, type SortDir, type SortMode, type ViewMode, type Watchlist,

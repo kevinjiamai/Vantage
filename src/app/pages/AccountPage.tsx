@@ -1,4 +1,4 @@
-import { type User } from "firebase/auth";
+import { type User } from "../lib/account";
 import { Settings } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { AuthPanel, ManageAccountDialog } from "../components/auth";
@@ -20,7 +20,7 @@ export function AccountPage({
   totalCost: number;
   onResetTradeHistory: () => void;
   onSignOut: () => void;
-  onDeleteAccount: () => Promise<void>;
+  onDeleteAccount: (password: string) => Promise<void>;
   onAuthDone: (mode: "signin" | "signup", email: string, password: string, name: string) => Promise<void>;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);

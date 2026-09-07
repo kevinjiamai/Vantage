@@ -1,4 +1,4 @@
-import { auth } from "./firebase";
+import { authHeader as sessionHeader } from "./account";
 import { apiUrl } from "./stocks";
 import type { StockMeta, TimeRange } from "./stocks";
 
@@ -68,19 +68,13 @@ export type ChatEvent =
   | { type: "tool"; name: string }
   | { type: "error"; message: string };
 
-async function authHeader(): Promise<Record<string, string>> {
-  const user = auth.currentUser;
-  if (!user) return {};
-  try {
-    return { Authorization: `Bearer ${await user.getIdToken()}` };
-  } catch {
-    return {};
-  }
+function authHeader(): Record<string, string> {
+  return sessionHeader();
 }
 
 export async function fetchChatStatus(): Promise<ChatStatus | null> {
   try {
-    const res = await fetch(apiUrl("/api/chat/status"), { headers: await authHeader() });
+    const res = await fetch(apiUrl("/api/chat/status"), { headers: authHeader() });
     return res.ok ? await res.json() : null;
   } catch {
     return null;
@@ -144,7 +138,7 @@ export async function* streamChatReply(
 
   const res = await fetch(apiUrl("/api/chat"), {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...(await authHeader()) },
+    headers: { "Content-Type": "application/json", ...(authHeader()) },
     body: JSON.stringify({
       messages,
       symbols: ctx.watchlistSymbols,

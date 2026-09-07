@@ -1,5 +1,5 @@
 import { ALL_SYMBOLS, type TimeRange } from "./lib/stocks";
-import { DEFAULT_PREFS, type UserPrefs } from "./lib/firebase";
+import { DEFAULT_PREFS, type UserPrefs } from "./lib/account";
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 

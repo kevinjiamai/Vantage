@@ -1,6 +1,6 @@
 import { Eye, EyeOff } from "lucide-react";
 import { useState } from "react";
-import { authErrorMessage } from "../../lib/firebase";
+import { authErrorMessage } from "../../lib/account";
 import { G, R } from "../../lib/format";
 
 export function AuthPanel({
