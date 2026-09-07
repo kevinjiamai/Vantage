@@ -8,7 +8,8 @@ from __future__ import annotations
 import os
 import re
 import secrets
-from datetime import timedelta
+import threading
+from datetime import datetime, timedelta
 
 import bcrypt
 import jwt
@@ -36,6 +37,55 @@ MIN_PASSWORD = 8
 # bcrypt silently truncates beyond 72 bytes, which would make a long password
 # weaker than it looks. Reject instead.
 MAX_PASSWORD = 72
+
+
+# Chat questions per UTC day, by tier. Tier lives on the user row, which only
+# this service writes.
+def _int_env(name: str, fallback: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip() or fallback)
+    except ValueError:
+        return fallback
+
+
+LIMITS = {
+    "anonymous": _int_env("CHAT_LIMIT_ANONYMOUS", 3),
+    "free": _int_env("CHAT_LIMIT_FREE", 20),
+    "plus": _int_env("CHAT_LIMIT_PLUS", 200),
+}
+
+# Failed sign-ins per address, to blunt credential stuffing against a public
+# endpoint. In memory: losing the counter on restart costs an attacker more
+# time than it saves them, and it keeps sign-in off the write path.
+_LOGIN_WINDOW = timedelta(minutes=15)
+_LOGIN_MAX_FAILURES = 8
+_login_failures: dict[str, list[datetime]] = {}
+_login_lock = threading.Lock()
+
+
+def _prune(entries: list[datetime], now: datetime) -> list[datetime]:
+    return [t for t in entries if now - t < _LOGIN_WINDOW]
+
+
+def login_blocked(address: str) -> bool:
+    now = utcnow()
+    with _login_lock:
+        entries = _prune(_login_failures.get(address, []), now)
+        _login_failures[address] = entries
+        return len(entries) >= _LOGIN_MAX_FAILURES
+
+
+def record_login_failure(address: str) -> None:
+    now = utcnow()
+    with _login_lock:
+        entries = _prune(_login_failures.get(address, []), now)
+        entries.append(now)
+        _login_failures[address] = entries
+
+
+def clear_login_failures(address: str) -> None:
+    with _login_lock:
+        _login_failures.pop(address, None)
 
 
 class AccountError(Exception):
@@ -117,12 +167,16 @@ def create_user(email: str, password: str, name: str = "") -> User:
 
 def authenticate(email: str, password: str) -> User:
     address = (email or "").strip().lower()
+    if login_blocked(address):
+        raise AccountError("too many failed attempts; try again in a few minutes", 429)
     with session() as s:
         user = s.scalar(select(User).where(User.email == address))
     # Same message either way: distinguishing them tells an attacker which
     # addresses have accounts.
     if user is None or not verify_password(password, user.password_hash):
+        record_login_failure(address)
         raise AccountError("email or password is incorrect", 401)
+    clear_login_failures(address)
     return user
 
 

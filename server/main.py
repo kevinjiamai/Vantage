@@ -16,11 +16,11 @@ import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
-from auth import (
-    LIMITS, AuthError, check_and_consume, peek_usage, refund, tier_for,
-    usage_key, verify_id_token,
-)
+import accounts
+from accounts import LIMITS, AccountError
+from db import consume_usage, init_db, load_state, peek_usage, refund_usage, save_state
 from llm import BYO_HOSTS, LLM_API_KEY, LLMError, Provider, stream_chat
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -1497,13 +1497,8 @@ async def chat(request: Request):
         if isinstance(s, str) and s.strip()
     ][:MAX_CHAT_SYMBOLS]
 
-    uid = None
-    header = request.headers.get("authorization") or ""
-    if header.lower().startswith("bearer "):
-        try:
-            uid = verify_id_token(header[7:].strip()).get("sub")
-        except AuthError as exc:
-            raise HTTPException(401, str(exc))
+    user = current_user(request)
+    uid = user.id if user else None
 
     byo = body.get("byo") if isinstance(body.get("byo"), dict) else None
     try:
@@ -1511,13 +1506,13 @@ async def chat(request: Request):
     except LLMError as exc:
         raise HTTPException(exc.status or 400, str(exc))
 
-    tier = "byo" if provider.byo else tier_for(uid)
-    key = usage_key(uid, request.client.host if request.client else "unknown")
+    tier = "byo" if provider.byo else (user.tier if user else "anonymous")
+    key = f"uid:{uid}" if uid else f"ip:{request.client.host if request.client else 'unknown'}"
     if provider.byo:
         used, limit = 0, 0          # their key, their budget
     else:
         limit = LIMITS.get(tier, LIMITS["anonymous"])
-        allowed, used, limit = check_and_consume(key, limit)
+        allowed, used, limit = consume_usage(key, limit)
         if not allowed:
             raise HTTPException(
                 429,
@@ -1577,11 +1572,11 @@ async def chat(request: Request):
             yield _sse("done", {"used": used, "limit": limit})
         except LLMError as exc:
             if not produced and not provider.byo:
-                refund(key)
+                refund_usage(key)
             yield _sse("error", {"message": str(exc), "status": exc.status})
         except Exception as exc:
             if not produced and not provider.byo:
-                refund(key)
+                refund_usage(key)
             yield _sse("error", {"message": f"chat failed: {exc}"})
 
     return StreamingResponse(events(), media_type="text/event-stream",
@@ -1590,24 +1585,153 @@ async def chat(request: Request):
 
 @app.get("/api/chat/status")
 def chat_status(request: Request):
-    uid = None
-    header = request.headers.get("authorization") or ""
-    if header.lower().startswith("bearer "):
-        try:
-            uid = verify_id_token(header[7:].strip()).get("sub")
-        except AuthError:
-            uid = None
-    tier = tier_for(uid)
-    key = usage_key(uid, request.client.host if request.client else "unknown")
+    user = current_user(request)
+    tier = user.tier if user else "anonymous"
+    key = f"uid:{user.id}" if user else f"ip:{request.client.host if request.client else 'unknown'}"
     limit = LIMITS.get(tier, LIMITS["anonymous"])
     return {
         "tier": tier,
         "used": peek_usage(key),
         "limit": limit,
-        "signed_in": bool(uid),
+        "signed_in": bool(user),
         "service_model_available": bool(LLM_API_KEY),
         "byo_hosts": sorted(BYO_HOSTS),
     }
+
+
+# ─── Accounts ──────────────────────────────────────────────────────────────────
+# Identity is this service's own. The browser posts here; it never talks to an
+# identity provider directly.
+
+init_db()
+
+MAX_STATE_BYTES = 512_000
+
+
+class SignupBody(BaseModel):
+    email: str
+    password: str
+    name: str = ""
+
+
+class LoginBody(BaseModel):
+    email: str
+    password: str
+
+
+class NameBody(BaseModel):
+    name: str
+
+
+class PasswordBody(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class DeleteBody(BaseModel):
+    password: str
+
+
+def _bearer(request: Request) -> str:
+    header = request.headers.get("authorization") or ""
+    return header[7:].strip() if header.lower().startswith("bearer ") else ""
+
+
+def current_user(request: Request):
+    """The signed-in user, or None. Never raises: some routes allow guests."""
+    token = _bearer(request)
+    return accounts.user_from_token(token) if token else None
+
+
+def require_user(request: Request):
+    user = current_user(request)
+    if user is None:
+        raise HTTPException(401, "sign in to continue")
+    return user
+
+
+def _session_response(user) -> dict[str, Any]:
+    return {"token": accounts.issue_token(user), "user": accounts.public_user(user)}
+
+
+@app.post("/api/auth/signup")
+def auth_signup(body: SignupBody):
+    try:
+        user = accounts.create_user(body.email, body.password, body.name)
+    except AccountError as exc:
+        raise HTTPException(exc.status, str(exc))
+    return _session_response(user)
+
+
+@app.post("/api/auth/login")
+def auth_login(body: LoginBody):
+    try:
+        user = accounts.authenticate(body.email, body.password)
+    except AccountError as exc:
+        raise HTTPException(exc.status, str(exc))
+    return _session_response(user)
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request):
+    return {"user": accounts.public_user(require_user(request))}
+
+
+@app.patch("/api/auth/me")
+def auth_update_name(body: NameBody, request: Request):
+    user = require_user(request)
+    try:
+        return {"user": accounts.public_user(accounts.update_name(user.id, body.name))}
+    except AccountError as exc:
+        raise HTTPException(exc.status, str(exc))
+
+
+@app.post("/api/auth/password")
+def auth_change_password(body: PasswordBody, request: Request):
+    user = require_user(request)
+    try:
+        accounts.change_password(user.id, body.current_password, body.new_password)
+    except AccountError as exc:
+        raise HTTPException(exc.status, str(exc))
+    # The change retired every existing token, this one included.
+    with accounts.session() as s:
+        refreshed = s.get(accounts.User, user.id)
+    return _session_response(refreshed)
+
+
+@app.delete("/api/auth/account")
+def auth_delete_account(body: DeleteBody, request: Request):
+    user = require_user(request)
+    # Re-authenticate: a stolen session should not be able to destroy the account.
+    if not accounts.verify_password(body.password, user.password_hash):
+        raise HTTPException(401, "password is incorrect")
+    accounts.delete_user(user.id)
+    return {"deleted": True}
+
+
+# ─── Saved state ───────────────────────────────────────────────────────────────
+
+
+@app.get("/api/state")
+def get_state(request: Request):
+    user = require_user(request)
+    return {"state": load_state(user.id)}
+
+
+@app.put("/api/state")
+async def put_state(request: Request):
+    user = require_user(request)
+    raw = await request.body()
+    if len(raw) > MAX_STATE_BYTES:
+        raise HTTPException(413, f"state must be under {MAX_STATE_BYTES // 1000}KB")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "state must be JSON")
+    if not isinstance(data, dict):
+        raise HTTPException(400, "state must be a JSON object")
+    save_state(user.id, data)
+    return {"saved": True}
 
 
 @app.get("/api/health")
