@@ -2,19 +2,18 @@
 /**
  * Save this account's Firestore document to a local JSON file.
  *
- * Run this before migrating off Firebase. The password is read from the
- * terminal with echo off and is never written to disk or printed.
+ * Run before migrating off Firebase. Uses the Firebase REST APIs directly so it
+ * needs no dependencies -- the firebase package is no longer installed.
+ *
+ * The password is read with terminal echo off and is never written or printed.
  *
  *   node scripts/backup-firestore.mjs
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
-import { initializeApp } from "firebase/app";
-import { getAuth, signInWithEmailAndPassword } from "firebase/auth";
-import { doc, getDoc, getFirestore } from "firebase/firestore";
 
 function loadEnv() {
-  for (const file of [".env.local", ".env"]) {
+  for (const file of [".env.local", ".env", ".env.production"]) {
     try {
       for (const line of readFileSync(file, "utf8").split("\n")) {
         const match = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)$/);
@@ -23,7 +22,7 @@ function loadEnv() {
         }
       }
     } catch {
-      /* both files are optional */
+      /* every file is optional */
     }
   }
 }
@@ -68,78 +67,105 @@ function askHidden(question) {
           process.stdout.write("\n");
           process.exit(130);
         }
-        if (code === 127 || code === 8) {
-          value = value.slice(0, -1);
-        } else if (code >= 32) {
-          value += char;
-        }
+        if (code === 127 || code === 8) value = value.slice(0, -1);
+        else if (code >= 32) value += char;
       }
     };
     stdin.on("data", onData);
   });
 }
 
-const REQUIRED = [
-  "VITE_FIREBASE_API_KEY",
-  "VITE_FIREBASE_AUTH_DOMAIN",
-  "VITE_FIREBASE_PROJECT_ID",
-  "VITE_FIREBASE_STORAGE_BUCKET",
-  "VITE_FIREBASE_MESSAGING_SENDER_ID",
-  "VITE_FIREBASE_APP_ID",
-];
+/**
+ * Firestore's REST API returns every value wrapped in its type, e.g.
+ * {stringValue: "AAPL"} or {arrayValue: {values: [...]}}. Unwrap to plain JSON.
+ */
+function decode(value) {
+  if (value == null) return null;
+  if ("nullValue" in value) return null;
+  if ("stringValue" in value) return value.stringValue;
+  if ("booleanValue" in value) return value.booleanValue;
+  // Integers arrive as strings to survive values beyond 2^53.
+  if ("integerValue" in value) return Number(value.integerValue);
+  if ("doubleValue" in value) return Number(value.doubleValue);
+  if ("timestampValue" in value) return value.timestampValue;
+  if ("bytesValue" in value) return value.bytesValue;
+  if ("referenceValue" in value) return value.referenceValue;
+  if ("geoPointValue" in value) return value.geoPointValue;
+  if ("arrayValue" in value) return (value.arrayValue.values ?? []).map(decode);
+  if ("mapValue" in value) return decodeFields(value.mapValue.fields ?? {});
+  return null;
+}
+
+function decodeFields(fields) {
+  const out = {};
+  for (const [key, value] of Object.entries(fields)) out[key] = decode(value);
+  return out;
+}
 
 async function main() {
   loadEnv();
-  const missing = REQUIRED.filter(key => !process.env[key]);
-  if (missing.length) {
-    console.error(`Missing from .env: ${missing.join(", ")}`);
+  const apiKey = process.env.VITE_FIREBASE_API_KEY;
+  const projectId = process.env.VITE_FIREBASE_PROJECT_ID;
+  if (!apiKey || !projectId) {
+    console.error(
+      "Missing VITE_FIREBASE_API_KEY / VITE_FIREBASE_PROJECT_ID.\n" +
+      "Expected in .env, .env.local or .env.production."
+    );
     process.exit(1);
   }
-
-  const app = initializeApp({
-    apiKey: process.env.VITE_FIREBASE_API_KEY,
-    authDomain: process.env.VITE_FIREBASE_AUTH_DOMAIN,
-    projectId: process.env.VITE_FIREBASE_PROJECT_ID,
-    storageBucket: process.env.VITE_FIREBASE_STORAGE_BUCKET,
-    messagingSenderId: process.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
-    appId: process.env.VITE_FIREBASE_APP_ID,
-  });
+  console.log(`Project: ${projectId}\n`);
 
   const email = await ask("Email: ");
   const password = await askHidden("Password: ");
 
-  let cred;
-  try {
-    cred = await signInWithEmailAndPassword(getAuth(app), email, password);
-  } catch (err) {
-    console.error(`Sign-in failed: ${err?.code ?? err}`);
+  const signIn = await fetch(
+    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password, returnSecureToken: true }),
+    },
+  );
+  const auth = await signIn.json();
+  if (!signIn.ok) {
+    console.error(`\nSign-in failed: ${auth?.error?.message ?? signIn.status}`);
     process.exit(1);
   }
 
-  const snap = await getDoc(doc(getFirestore(app), "users", cred.user.uid));
-  if (!snap.exists()) {
-    console.error(`No document at users/${cred.user.uid}. Nothing to back up.`);
+  const { idToken, localId: uid, displayName = "" } = auth;
+  const docUrl =
+    `https://firestore.googleapis.com/v1/projects/${projectId}` +
+    `/databases/(default)/documents/users/${uid}`;
+  const res = await fetch(docUrl, { headers: { Authorization: `Bearer ${idToken}` } });
+  const doc = await res.json();
+  if (!res.ok) {
+    console.error(`\nCould not read users/${uid}: ${doc?.error?.message ?? res.status}`);
     process.exit(1);
   }
 
+  const document = decodeFields(doc.fields ?? {});
   const payload = {
     exported_at: new Date().toISOString(),
-    uid: cred.user.uid,
-    email: cred.user.email,
-    display_name: cred.user.displayName ?? "",
-    document: snap.data(),
+    uid,
+    email: auth.email ?? email,
+    display_name: displayName,
+    document,
   };
 
   mkdirSync("backups", { recursive: true });
   const path = `backups/firestore-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
   writeFileSync(path, JSON.stringify(payload, null, 2));
 
-  const d = payload.document ?? {};
   console.log(`\nSaved ${path}`);
-  console.log(`  watchlists   ${(d.watchlists ?? []).length}`);
-  console.log(`  holdings     ${(d.holdings ?? []).length}`);
-  console.log(`  transactions ${(d.transactions ?? []).length}`);
-  console.log(`  balance      ${d.balance ?? 0}`);
+  console.log(`  uid          ${uid}`);
+  console.log(`  watchlists   ${(document.watchlists ?? []).length}`);
+  for (const w of document.watchlists ?? []) {
+    console.log(`     ${w.name ?? w.id} — ${(w.symbols ?? []).length} symbols`);
+  }
+  console.log(`  holdings     ${(document.holdings ?? []).length}`);
+  console.log(`  transactions ${(document.transactions ?? []).length}`);
+  console.log(`  balance      ${document.balance ?? 0}`);
+  console.log(`  profile      ${document.profile?.name ?? "(none)"}`);
   process.exit(0);
 }
 
