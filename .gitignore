@@ -23,3 +23,6 @@ server/vantage.db
 
 # Deployment values stay out of the repo; see .env.example for the shape.
 .env.production
+
+# Account data exports. Never commit these.
+backups/
